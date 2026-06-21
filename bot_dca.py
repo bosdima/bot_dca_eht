@@ -856,7 +856,8 @@ class Database:
         """Получает завершенные продажи, по которым еще не было уведомления"""
         try:
             conn = sqlite3.connect(self.db_file, timeout=5)
-            conn.row_factory = sqlite3.Row            cursor = conn.cursor()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
             if symbol:
                 cursor.execute('SELECT * FROM completed_sells WHERE symbol = ? AND notified = 0 ORDER BY sold_at DESC', (symbol,))
             else:
