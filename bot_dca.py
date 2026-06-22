@@ -2241,7 +2241,7 @@ class DCAStrategy:
         
         while True:
             try:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(600)
                 
                 logger.info(f"Hourly check for {symbol} sell order...")
                 
