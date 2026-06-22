@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.0 (22.06.2026)
+Версия 5.6.1 (22.06.2026)
 ИСПРАВЛЕНИЯ:
-- Округление количества для продажи
-- Исправление уведомлений о пропущенных покупках
-- Улучшенная обработка ошибок
+- Округление количества для продажи (исправлена ошибка quantity decimals)
+- Правильное определение количества знаков из qty_step
+- Добавлена проверка баланса перед продажей
 """
 
 import os
@@ -69,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.0 (22.06.2026)"
+BOT_VERSION = "5.6.1 (22.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -146,8 +146,6 @@ def round_price_up(price: float) -> float:
     return math.ceil(price * 100) / 100
 
 def round_quantity_for_sell(quantity: float, min_qty: float = 0.01) -> float:
-    """Округление количества для продажи с учетом минимального количества"""
-    # Округляем до 4 знаков для ETH и других монет
     rounded = math.floor(quantity * 10000) / 10000
     if rounded < min_qty:
         rounded = min_qty
@@ -1806,16 +1804,20 @@ class BybitClient:
         if qty_step <= 0:
             return round(quantity, 4)
         
+        # Определяем количество знаков из шага
+        step_str = str(qty_step)
+        if '.' in step_str:
+            decimal_places = len(step_str.split('.')[-1])
+        else:
+            decimal_places = 4
+        
         # Округляем вниз до шага
-        qty_decimal = Decimal(str(quantity))
-        step_decimal = Decimal(str(qty_step))
-        rounded = float((qty_decimal // step_decimal) * step_decimal)
+        rounded = math.floor(quantity / qty_step) * qty_step
         
         if rounded < min_qty:
             rounded = min_qty
         
-        # Ограничиваем количество знаков после запятой
-        decimal_places = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 4
+        # Округляем до нужного количества знаков
         return round(rounded, decimal_places)
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
@@ -1935,22 +1937,20 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            # Округляем количество с учетом шага
+            # ✅ Округляем количество с учетом шага
             rounded_quantity = self._round_quantity_by_step(quantity, qty_step, min_qty)
+            
+            # Проверяем баланс
+            coin = symbol.replace('USDT', '')
+            balance = await self.get_balance(coin)
+            if balance and balance.get('equity', 0) < rounded_quantity:
+                rounded_quantity = self._round_quantity_by_step(balance.get('equity', 0), qty_step, min_qty)
             
             if rounded_quantity < min_qty:
                 if rounded_quantity <= 0:
                     rounded_quantity = min_qty
                 else:
                     return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
-            
-            # Проверяем, что количество не превышает баланс
-            coin = symbol.replace('USDT', '')
-            balance = await self.get_balance(coin)
-            if balance and balance.get('equity', 0) < rounded_quantity:
-                rounded_quantity = self._round_quantity_by_step(balance.get('equity', 0), qty_step, min_qty)
-                if rounded_quantity < min_qty:
-                    return {'success': False, 'error': f'Недостаточно {coin} для продажи'}
             
             order_value = rounded_quantity * rounded_price
             if order_value < min_amt:
@@ -2104,7 +2104,6 @@ class DCAStrategy:
             logger.error(f"Error sending notification: {e}")
     
     async def _send_purchase_skipped_notification(self, symbol: str, reason: str, current_price: float, avg_price: float, bot):
-        """Отправка уведомления о пропущенной покупке"""
         user_id = self.db.get_authorized_user_id()
         if not user_id:
             return
