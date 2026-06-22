@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.5.1 (21.06.2026)
-УПРОЩЕННАЯ ЛОГИКА:
-- При запуске DCA проверяет баланс и создает ордер на продажу если нужно
-- Каждый час проверяет наличие ордера на продажу
-- Если ордер удален - создает новый с уведомлением
-- Простая и понятная логика работы
+Версия 5.6.0 (22.06.2026)
+ИСПРАВЛЕНИЯ:
+- Округление количества для продажи
+- Исправление уведомлений о пропущенных покупках
+- Улучшенная обработка ошибок
 """
 
 import os
@@ -70,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.5.1 (21.06.2026)"
+BOT_VERSION = "5.6.0 (22.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -147,8 +146,11 @@ def round_price_up(price: float) -> float:
     return math.ceil(price * 100) / 100
 
 def round_quantity_for_sell(quantity: float, min_qty: float = 0.01) -> float:
-    rounded = math.floor(quantity * 100) / 100
-    if rounded < min_qty: rounded = min_qty
+    """Округление количества для продажи с учетом минимального количества"""
+    # Округляем до 4 знаков для ETH и других монет
+    rounded = math.floor(quantity * 10000) / 10000
+    if rounded < min_qty:
+        rounded = min_qty
     return rounded
 
 def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
@@ -1614,6 +1616,8 @@ class Database:
         except Exception as e:
             logger.error(f"Error importing database: {e}")
             return False, str(e)
+
+
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
@@ -1773,10 +1777,13 @@ class BybitClient:
                 min_qty = float(lot_size_filter.get('minOrderQty', 0.01))
                 min_amt = float(lot_size_filter.get('minOrderAmt', 5))
                 
+                qty_step_str = lot_size_filter.get('qtyStep', '0.01')
+                qty_step = float(qty_step_str)
+                
                 return {
                     'min_qty': min_qty,
                     'min_amt': min_amt,
-                    'qty_step': float(lot_size_filter.get('qtyStep', 0.01)),
+                    'qty_step': qty_step,
                     'tick_size': tick_size,
                     'base_precision': base_precision,
                 }
@@ -1792,6 +1799,23 @@ class BybitClient:
         if rounded <= 0:
             rounded = tick_size
         decimal_places = len(str(tick_size).split('.')[-1]) if '.' in str(tick_size) else 4
+        return round(rounded, decimal_places)
+    
+    def _round_quantity_by_step(self, quantity: float, qty_step: float, min_qty: float) -> float:
+        """Округление количества с учетом шага и минимального количества"""
+        if qty_step <= 0:
+            return round(quantity, 4)
+        
+        # Округляем вниз до шага
+        qty_decimal = Decimal(str(quantity))
+        step_decimal = Decimal(str(qty_step))
+        rounded = float((qty_decimal // step_decimal) * step_decimal)
+        
+        if rounded < min_qty:
+            rounded = min_qty
+        
+        # Ограничиваем количество знаков после запятой
+        decimal_places = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 4
         return round(rounded, decimal_places)
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
@@ -1911,13 +1935,22 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            rounded_quantity = quantity
+            # Округляем количество с учетом шага
+            rounded_quantity = self._round_quantity_by_step(quantity, qty_step, min_qty)
             
             if rounded_quantity < min_qty:
                 if rounded_quantity <= 0:
                     rounded_quantity = min_qty
                 else:
                     return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
+            
+            # Проверяем, что количество не превышает баланс
+            coin = symbol.replace('USDT', '')
+            balance = await self.get_balance(coin)
+            if balance and balance.get('equity', 0) < rounded_quantity:
+                rounded_quantity = self._round_quantity_by_step(balance.get('equity', 0), qty_step, min_qty)
+                if rounded_quantity < min_qty:
+                    return {'success': False, 'error': f'Недостаточно {coin} для продажи'}
             
             order_value = rounded_quantity * rounded_price
             if order_value < min_amt:
@@ -1935,6 +1968,8 @@ class BybitClient:
                 return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
+            if response['retCode'] == 170137:
+                return {'success': False, 'error': 'quantity_decimals_error', 'message': response['retMsg'], 'quantity': rounded_quantity}
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             logger.error(f"Error placing sell order: {e}")
@@ -1962,31 +1997,33 @@ class BybitClient:
             
             quantity = amount_usdt / rounded_price
             
-            qty_decimal = Decimal(str(quantity))
-            step_decimal = Decimal(str(qty_step))
-            quantity = float((qty_decimal // step_decimal) * step_decimal)
+            # Округляем количество с учетом шага
+            rounded_quantity = self._round_quantity_by_step(quantity, qty_step, min_qty)
             
-            if quantity < min_qty:
-                quantity = min_qty
-            
-            order_value = quantity * rounded_price
+            order_value = rounded_quantity * rounded_price
             if order_value < min_amt:
-                max_iter = 50
-                for _ in range(max_iter):
-                    if quantity * rounded_price >= min_amt:
-                        break
-                    quantity += qty_step
-                order_value = quantity * rounded_price
-                logger.info(f"Скорректировано количество: {quantity} (~{order_value:.2f} USDT)")
+                # Пытаемся увеличить количество до минимальной суммы
+                needed_quantity = min_amt / rounded_price
+                rounded_needed = self._round_quantity_by_step(needed_quantity, qty_step, min_qty)
+                if rounded_needed * rounded_price >= min_amt:
+                    rounded_quantity = rounded_needed
+                    order_value = rounded_quantity * rounded_price
+                    logger.info(f"Скорректировано количество: {rounded_quantity} (~{order_value:.2f} USDT)")
+                else:
+                    # Пробуем добавить один шаг
+                    rounded_quantity += qty_step
+                    order_value = rounded_quantity * rounded_price
+                    if order_value < min_amt:
+                        return {'success': False, 'error': f'Минимальная сумма ордера: {min_amt} USDT'}
             
-            logger.info(f"Placing buy order: {quantity} {symbol} @ {rounded_price}")
+            logger.info(f"Placing buy order: {rounded_quantity} {symbol} @ {rounded_price}")
             
             response = self.session.place_order(
                 category="spot", symbol=symbol, side="Buy", orderType="Limit", 
-                qty=str(quantity), price=str(rounded_price), timeInForce="GTC"
+                qty=str(rounded_quantity), price=str(rounded_price), timeInForce="GTC"
             )
             if response['retCode'] == 0:
-                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(quantity), 'price': rounded_price, 'total_usdt': order_value}
+                return {'success': True, 'order_id': response['result']['orderId'], 'quantity': float(rounded_quantity), 'price': rounded_price, 'total_usdt': order_value}
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             return {'success': False, 'error': response['retMsg'], 'code': response['retCode']}
@@ -2066,6 +2103,27 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
     
+    async def _send_purchase_skipped_notification(self, symbol: str, reason: str, current_price: float, avg_price: float, bot):
+        """Отправка уведомления о пропущенной покупке"""
+        user_id = self.db.get_authorized_user_id()
+        if not user_id:
+            return
+        
+        message = (
+            f"⏭ *ПОКУПКА ПРОПУЩЕНА*\n\n"
+            f"🪙 Пара: `{symbol}`\n"
+            f"💰 Текущая цена: `{format_price(current_price, 4)}` USDT\n"
+            f"📊 Средняя цена: `{format_price(avg_price, 4)}` USDT\n"
+            f"❗ *Причина:* {reason}\n\n"
+            f"🔄 Следующая проверка по расписанию."
+        )
+        
+        try:
+            await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+            logger.info(f"Purchase skipped notification sent: {reason}")
+        except Exception as e:
+            logger.error(f"Error sending purchase skipped notification: {e}")
+    
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
         try:
             coin = symbol.replace('USDT', '')
@@ -2111,12 +2169,14 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             tick_size = instrument_info['tick_size']
+            qty_step = instrument_info['qty_step']
             
             rounded_price = self.bybit._round_price_by_tick(target_price, tick_size)
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            sell_quantity = current_balance
+            # Округляем количество с учетом шага
+            sell_quantity = self.bybit._round_quantity_by_step(current_balance, qty_step, min_qty)
             
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
@@ -2126,6 +2186,7 @@ class DCAStrategy:
             order_value = sell_quantity * rounded_price
             if order_value < min_amt:
                 needed_quantity = min_amt / rounded_price
+                needed_quantity = self.bybit._round_quantity_by_step(needed_quantity, qty_step, min_qty)
                 if needed_quantity <= current_balance:
                     sell_quantity = needed_quantity
                     order_value = sell_quantity * rounded_price
@@ -2247,7 +2308,8 @@ class DCAStrategy:
         qty_step = instrument_info['qty_step']
         tick_size = instrument_info['tick_size']
         
-        rounded_quantity = quantity
+        # Округляем количество с учетом шага
+        rounded_quantity = self.bybit._round_quantity_by_step(quantity, qty_step, min_qty)
         
         if rounded_quantity <= 0:
             rounded_quantity = min_qty
@@ -2359,6 +2421,27 @@ class DCAStrategy:
                 'pending_id': pending_id,
                 'reason': f'Минимальная сумма ордера: {min_amt} USDT'
             }
+        elif result.get('error') == 'quantity_decimals_error':
+            # Пробуем уменьшить количество знаков после запятой
+            qty_step = instrument_info['qty_step']
+            retry_quantity = self.bybit._round_quantity_by_step(rounded_quantity, qty_step, min_qty)
+            if retry_quantity != rounded_quantity and retry_quantity >= min_qty:
+                logger.info(f"Retrying with rounded quantity: {retry_quantity}")
+                return await self._try_place_sell_order(symbol, retry_quantity, target_price, profit_percent, bot)
+            else:
+                pending_id = self.db.add_pending_sell_order(
+                    symbol=symbol,
+                    quantity=rounded_quantity,
+                    target_price=rounded_price,
+                    profit_percent=profit_percent,
+                    fail_reason=f'Ошибка формата количества: {result.get("message")}'
+                )
+                return {
+                    'success': False,
+                    'pending': True,
+                    'pending_id': pending_id,
+                    'reason': f'Ошибка формата количества'
+                }
         else:
             error_msg = result.get('error', 'Неизвестная ошибка')
             pending_id = self.db.add_pending_sell_order(
@@ -2430,6 +2513,7 @@ class DCAStrategy:
             logger.info(f"Pending sell notification sent")
         except Exception as e:
             logger.error(f"Error sending pending sell notification: {e}")
+    
     async def execute_scheduled_purchase(self, symbol: str, profit_percent: float, bot) -> Dict:
         current_price = await self.bybit.get_symbol_price(symbol)
         if not current_price:
@@ -2443,12 +2527,18 @@ class DCAStrategy:
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
         
-        if stats and stats['total_quantity'] > 0 and current_price > stats['avg_price']:
-            return {
-                'success': False, 
-                'error': 'skip_price_above_avg',
-                'message': f'⚠️ Покупка пропущена: текущая цена ({format_price(current_price, 4)}) ВЫШЕ средней цены ({format_price(stats["avg_price"], 4)}).'
-            }
+        # Проверяем, что цена ниже средней
+        if stats and stats['total_quantity'] > 0:
+            avg_price = stats['avg_price']
+            if current_price > avg_price:
+                reason = f'Текущая цена ({format_price(current_price, 4)}) ВЫШЕ средней цены ({format_price(avg_price, 4)})'
+                logger.info(f"Scheduled purchase skipped: {reason}")
+                await self._send_purchase_skipped_notification(symbol, reason, current_price, avg_price, bot)
+                return {
+                    'success': False, 
+                    'error': 'skip_price_above_avg',
+                    'message': f'⚠️ Покупка пропущена: {reason}'
+                }
         
         if not stats or stats['total_quantity'] <= 0:
             amount_usdt = max(base_amount, min_amt)
@@ -3378,9 +3468,8 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            qty_decimal = Decimal(str(available_qty))
-            step_decimal = Decimal(str(qty_step))
-            sell_qty = float((qty_decimal // step_decimal) * step_decimal)
+            # Округляем количество с учетом шага
+            sell_qty = self.bybit._round_quantity_by_step(available_qty, qty_step, min_qty)
             
             if sell_qty < min_qty:
                 return {'success': False, 'error': f'Доступное количество ({available_qty:.6f}) меньше минимального ({min_qty})'}
@@ -3474,11 +3563,37 @@ class DCAStrategy:
                 if update and hasattr(update, 'message'):
                     await update.message.reply_text(msg, parse_mode='Markdown')
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': result.get('error'), 'message': msg}
+            elif result.get('error') == 'quantity_decimals_error':
+                # Пробуем с другим округлением
+                retry_qty = self.bybit._round_quantity_by_step(sell_qty, qty_step, min_qty)
+                if retry_qty != sell_qty:
+                    logger.info(f"Retrying with rounded quantity: {retry_qty}")
+                    return await self.place_full_sell_order(update, symbol, profit_percent, auto_cancel_old=False)
+                else:
+                    pending_id = self.db.add_pending_sell_order(
+                        symbol=symbol,
+                        quantity=sell_qty,
+                        target_price=rounded_price,
+                        profit_percent=profit_percent,
+                        fail_reason=f'Ошибка формата количества'
+                    )
+                    msg = (f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
+                           f"🪙 Токен: `{symbol}`\n"
+                           f"📊 Количество: `{format_quantity(sell_qty, 2)}` {coin}\n"
+                           f"💰 Целевая цена: `{format_price(rounded_price, 4)}` USDT\n"
+                           f"📈 Целевая прибыль: `{profit_percent}%`\n\n"
+                           f"⚠️ *Ошибка формата количества*\n\n"
+                           f"✅ Ордер сохранен и будет автоматически восстановлен.")
+                    if update and hasattr(update, 'message'):
+                        await update.message.reply_text(msg, parse_mode='Markdown')
+                    return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': result.get('error'), 'message': msg}
             else:
                 return {'success': False, 'error': result.get('error', 'Ошибка создания ордера')}
         except Exception as e:
             logger.error(f"Error placing full sell order: {e}")
             return {'success': False, 'error': str(e)}
+
+
 class FastDCABot:
     def __init__(self):
         self.db = Database()
@@ -5364,15 +5479,8 @@ class FastDCABot:
                             except:
                                 pass
                     elif result.get('error') == 'skip_price_above_avg':
-                        if self.authorized_user_id:
-                            try:
-                                await self.application.bot.send_message(
-                                    chat_id=self.authorized_user_id,
-                                    text=result.get('message', 'Покупка пропущена: цена выше средней'),
-                                    parse_mode='Markdown'
-                                )
-                            except:
-                                pass
+                        # Уведомление уже отправлено внутри execute_scheduled_purchase
+                        pass
                     else:
                         if self.authorized_user_id:
                             try:
