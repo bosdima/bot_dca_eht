@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.7.0 (23.06.2026)
+Версия 5.7.2 (23.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлено округление количества при продаже
-- Исправлен расчет объема для продажи (весь баланс)
-- Корректное округление до 4 знаков для ETH
-- Исправлена логика минимального количества
+- Исправлен расчет объема для продажи (используется весь баланс equity)
+- Добавлена проверка количества в существующих ордерах
+- Исправлено логирование баланса
+- Удален pending order при наличии активного ордера
 """
 
 import os
@@ -70,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.7.0 (23.06.2026)"
+BOT_VERSION = "5.7.2 (23.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -145,12 +145,6 @@ def format_quantity(qty: float, decimals: int = 6) -> str:
 
 def round_price_up(price: float) -> float:
     return math.ceil(price * 100) / 100
-
-def round_quantity_for_sell(quantity: float, min_qty: float = 0.01) -> float:
-    rounded = math.floor(quantity * 10000) / 10000
-    if rounded < min_qty:
-        rounded = min_qty
-    return rounded
 
 def get_ladder_levels(drop_percent: float, max_depth: float = MAX_DROP_DEPTH) -> Tuple[int, float]:
     if drop_percent <= 0: return 0, 0.0
@@ -1844,11 +1838,9 @@ class BybitClient:
             decimal_places = 4
         
         # Округляем вниз до шага
-        if quantity < qty_step:
-            if force_min and quantity > 0:
-                # Если нужно принудительно достичь минимума
-                if min_qty > 0:
-                    return min_qty
+        if quantity < qty_step and quantity > 0:
+            if force_min and min_qty > 0:
+                return min_qty
             return 0.0
         
         rounded = math.floor(quantity / qty_step) * qty_step
@@ -2180,8 +2172,10 @@ class DCAStrategy:
             if not balance_info or 'equity' not in balance_info:
                 return {'success': False, 'error': 'Не удалось получить баланс'}
             
+            # Используем equity (весь баланс), а не available
             current_balance = balance_info.get('equity', 0)
-            logger.info(f"Balance {coin}: {current_balance}")
+            available_balance = balance_info.get('available', 0)
+            logger.info(f"Balance {coin}: total={current_balance}, available={available_balance}")
             
             if current_balance <= 0:
                 if not silent:
@@ -2195,11 +2189,26 @@ class DCAStrategy:
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
+            # Проверяем, есть ли уже ордер на ПРОДАЖУ ВСЕГО БАЛАНСА
             if existing_sell_orders:
-                logger.info(f"Found {len(existing_sell_orders)} sell orders")
-                return {'success': True, 'message': f'Уже есть {len(existing_sell_orders)} ордер(ов) на продажу'}
+                # Проверяем, совпадает ли количество в ордере с балансом
+                total_in_orders = sum(float(o.get('qty', 0)) for o in existing_sell_orders)
+                # Если в ордерах примерно столько же, сколько на балансе - всё ок
+                if abs(total_in_orders - current_balance) < 0.0001:
+                    logger.info(f"Found {len(existing_sell_orders)} sell orders with correct quantity {total_in_orders}")
+                    return {'success': True, 'message': f'Уже есть ордер(а) на продажу {total_in_orders} {coin}'}
+                else:
+                    # Если количества не совпадают - отменяем старые ордера и создаем новый
+                    logger.info(f"Existing sell orders total {total_in_orders}, balance {current_balance}, recreating...")
+                    await self.cancel_old_sell_orders(symbol)
+                    await asyncio.sleep(1)
+                    # Удаляем pending ордера, если они есть
+                    pending_orders = self.db.get_pending_sell_orders(symbol)
+                    for p in pending_orders:
+                        self.db.delete_pending_sell_order(p['id'])
+                        logger.info(f"Removed pending order {p['id']} before creating new sell order")
             
-            logger.info("No sell order found, creating new one...")
+            logger.info("No matching sell order found, creating new one...")
             
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
@@ -2223,10 +2232,13 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            # Используем новый метод округления
+            # Используем ВЕСЬ баланс для продажи
             sell_quantity = self.bybit._round_quantity_for_order(current_balance, qty_step, min_qty, force_min=False)
             if sell_quantity <= 0:
                 sell_quantity = self.bybit._round_quantity_for_order(current_balance, qty_step, min_qty, force_min=True)
+            
+            # Логируем, что продаем
+            logger.info(f"Selling {sell_quantity} {coin} (balance: {current_balance})")
             
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
@@ -2306,7 +2318,15 @@ class DCAStrategy:
                 existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
                 
                 if existing_sell:
-                    logger.info(f"Sell order exists, all good")
+                    # Проверяем, что количество совпадает с балансом
+                    total_in_orders = sum(float(o.get('qty', 0)) for o in existing_sell)
+                    balance = balance_info.get('equity', 0)
+                    if abs(total_in_orders - balance) < 0.0001:
+                        logger.info(f"Sell order exists with correct quantity {total_in_orders}")
+                    else:
+                        logger.warning(f"Sell order quantity {total_in_orders} doesn't match balance {balance}, recreating...")
+                        await self._send_sell_order_removed_notification(symbol, bot)
+                        await self.check_and_create_sell_order(symbol, bot, silent=False)
                 else:
                     logger.warning("Sell order not found! Recreating...")
                     await self._send_sell_order_removed_notification(symbol, bot)
@@ -2332,6 +2352,13 @@ class DCAStrategy:
             
             for order_id in cancelled_ids:
                 self.db.update_sell_order_status(order_id, 'cancelled')
+                logger.info(f"Updated sell order {order_id} status to cancelled")
+            
+            # Также удаляем pending ордера
+            pending_orders = self.db.get_pending_sell_orders(symbol)
+            for p in pending_orders:
+                self.db.delete_pending_sell_order(p['id'])
+                logger.info(f"Removed pending order {p['id']} during cancellation")
             
             if cancelled_count > 0:
                 logger.info(f"Cancelled {cancelled_count} old sell orders, waiting 3 seconds for balance update...")
@@ -2844,6 +2871,16 @@ class DCAStrategy:
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
+        
+        # Проверяем, есть ли уже активный ордер на продажу
+        open_orders = await self.bybit.get_open_orders(symbol)
+        existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
+        if existing_sell:
+            # Удаляем все pending ордера, т.к. есть активный
+            for order in pending_orders:
+                self.db.delete_pending_sell_order(order['id'])
+                logger.info(f"Removed pending order {order['id']} because sell order already exists")
+            return []
         
         for order in pending_orders:
             last_retry = order.get('last_retry')
