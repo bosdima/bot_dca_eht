@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.2 (22.06.2026)
+Версия 5.7.0 (23.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлен метод get_balance (SPOT + UNIFIED)
-- Исправлена ошибка shutdown
-- Добавлена обработка ошибок баланса
+- Исправлено округление количества при продаже
+- Исправлен расчет объема для продажи (весь баланс)
+- Корректное округление до 4 знаков для ETH
+- Исправлена логика минимального количества
 """
 
 import os
@@ -69,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.2 (22.06.2026)"
+BOT_VERSION = "5.7.0 (23.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1822,23 +1823,46 @@ class BybitClient:
         decimal_places = len(str(tick_size).split('.')[-1]) if '.' in str(tick_size) else 4
         return round(rounded, decimal_places)
     
-    def _round_quantity_by_step(self, quantity: float, qty_step: float, min_qty: float) -> float:
-        """Округление количества с учетом шага и минимального количества"""
+    def _round_quantity_for_order(self, quantity: float, qty_step: float, min_qty: float, force_min: bool = False) -> float:
+        """
+        Округление количества для ордера с учетом шага и минимального количества
+        
+        Args:
+            quantity: количество для округления
+            qty_step: шаг количества (например 0.0001 для ETH)
+            min_qty: минимальное количество
+            force_min: если True, то при значении меньше min_qty округляем до min_qty
+        """
         if qty_step <= 0:
             return round(quantity, 4)
         
+        # Определяем количество знаков после запятой из шага
         step_str = str(qty_step)
         if '.' in step_str:
             decimal_places = len(step_str.split('.')[-1])
         else:
             decimal_places = 4
         
+        # Округляем вниз до шага
+        if quantity < qty_step:
+            if force_min and quantity > 0:
+                # Если нужно принудительно достичь минимума
+                if min_qty > 0:
+                    return min_qty
+            return 0.0
+        
         rounded = math.floor(quantity / qty_step) * qty_step
         
-        if rounded < min_qty:
-            rounded = min_qty
+        # Если результат меньше минимального и force_min=True, возвращаем min_qty
+        if force_min and rounded < min_qty and quantity > 0:
+            return min_qty
         
+        # Округляем до нужного количества знаков
         return round(rounded, decimal_places)
+    
+    def _round_quantity_by_step(self, quantity: float, qty_step: float, min_qty: float) -> float:
+        """Округление количества с учетом шага и минимального количества (для обратной совместимости)"""
+        return self._round_quantity_for_order(quantity, qty_step, min_qty, force_min=True)
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
@@ -1957,12 +1981,20 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            rounded_quantity = self._round_quantity_by_step(quantity, qty_step, min_qty)
+            # Округляем количество с учетом шага (без принудительного минимума для продажи)
+            rounded_quantity = self._round_quantity_for_order(quantity, qty_step, min_qty, force_min=False)
             
+            # Если после округления получилось 0, пробуем с принудительным минимумом
+            if rounded_quantity <= 0:
+                rounded_quantity = self._round_quantity_for_order(quantity, qty_step, min_qty, force_min=True)
+            
+            # Проверяем баланс
             coin = symbol.replace('USDT', '')
             balance = await self.get_balance(coin)
             if balance and balance.get('equity', 0) < rounded_quantity:
-                rounded_quantity = self._round_quantity_by_step(balance.get('equity', 0), qty_step, min_qty)
+                rounded_quantity = self._round_quantity_for_order(balance.get('equity', 0), qty_step, min_qty, force_min=False)
+                if rounded_quantity <= 0:
+                    rounded_quantity = self._round_quantity_for_order(balance.get('equity', 0), qty_step, min_qty, force_min=True)
             
             if rounded_quantity < min_qty:
                 if rounded_quantity <= 0:
@@ -2015,12 +2047,14 @@ class BybitClient:
             
             quantity = amount_usdt / rounded_price
             
-            rounded_quantity = self._round_quantity_by_step(quantity, qty_step, min_qty)
+            # Округляем количество с учетом шага (с принудительным минимумом для покупки)
+            rounded_quantity = self._round_quantity_for_order(quantity, qty_step, min_qty, force_min=True)
             
             order_value = rounded_quantity * rounded_price
             if order_value < min_amt:
+                # Пытаемся увеличить количество до минимальной суммы
                 needed_quantity = min_amt / rounded_price
-                rounded_needed = self._round_quantity_by_step(needed_quantity, qty_step, min_qty)
+                rounded_needed = self._round_quantity_for_order(needed_quantity, qty_step, min_qty, force_min=True)
                 if rounded_needed * rounded_price >= min_amt:
                     rounded_quantity = rounded_needed
                     order_value = rounded_quantity * rounded_price
@@ -2189,7 +2223,10 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            sell_quantity = self.bybit._round_quantity_by_step(current_balance, qty_step, min_qty)
+            # Используем новый метод округления
+            sell_quantity = self.bybit._round_quantity_for_order(current_balance, qty_step, min_qty, force_min=False)
+            if sell_quantity <= 0:
+                sell_quantity = self.bybit._round_quantity_for_order(current_balance, qty_step, min_qty, force_min=True)
             
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
@@ -2199,7 +2236,7 @@ class DCAStrategy:
             order_value = sell_quantity * rounded_price
             if order_value < min_amt:
                 needed_quantity = min_amt / rounded_price
-                needed_quantity = self.bybit._round_quantity_by_step(needed_quantity, qty_step, min_qty)
+                needed_quantity = self.bybit._round_quantity_for_order(needed_quantity, qty_step, min_qty, force_min=True)
                 if needed_quantity <= current_balance:
                     sell_quantity = needed_quantity
                     order_value = sell_quantity * rounded_price
@@ -2321,25 +2358,28 @@ class DCAStrategy:
         qty_step = instrument_info['qty_step']
         tick_size = instrument_info['tick_size']
         
-        rounded_quantity = self.bybit._round_quantity_by_step(quantity, qty_step, min_qty)
-        
+        # Используем новый метод округления для продажи (без принудительного минимума)
+        rounded_quantity = self.bybit._round_quantity_for_order(quantity, qty_step, min_qty, force_min=False)
         if rounded_quantity <= 0:
-            rounded_quantity = min_qty
+            rounded_quantity = self.bybit._round_quantity_for_order(quantity, qty_step, min_qty, force_min=True)
         
         if rounded_quantity < min_qty:
-            error_msg = f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'
-            await self._send_sell_order_failed_notification(
-                symbol=symbol,
-                quantity=quantity,
-                target_price=target_price,
-                profit_percent=profit_percent,
-                error=error_msg,
-                bot=bot
-            )
-            return {
-                'success': False, 
-                'error': error_msg
-            }
+            if rounded_quantity <= 0:
+                rounded_quantity = min_qty
+            else:
+                error_msg = f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'
+                await self._send_sell_order_failed_notification(
+                    symbol=symbol,
+                    quantity=quantity,
+                    target_price=target_price,
+                    profit_percent=profit_percent,
+                    error=error_msg,
+                    bot=bot
+                )
+                return {
+                    'success': False, 
+                    'error': error_msg
+                }
         
         rounded_price = self.bybit._round_price_by_tick(target_price, tick_size)
         
@@ -2435,7 +2475,7 @@ class DCAStrategy:
             }
         elif result.get('error') == 'quantity_decimals_error':
             qty_step = instrument_info['qty_step']
-            retry_quantity = self.bybit._round_quantity_by_step(rounded_quantity, qty_step, min_qty)
+            retry_quantity = self.bybit._round_quantity_for_order(rounded_quantity, qty_step, min_qty, force_min=True)
             if retry_quantity != rounded_quantity and retry_quantity >= min_qty:
                 logger.info(f"Retrying with rounded quantity: {retry_quantity}")
                 return await self._try_place_sell_order(symbol, retry_quantity, target_price, profit_percent, bot)
@@ -2642,7 +2682,11 @@ class DCAStrategy:
                 await self.cancel_old_sell_orders(symbol)
                 await asyncio.sleep(2)
             
-            sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell, target_price_sell, profit_percent, bot)
+            # Используем ВЕСЬ баланс для продажи
+            total_balance = balance_after.get('equity', 0) if balance_after else 0
+            logger.info(f"Total balance for sell: {total_balance:.8f} {coin}")
+            
+            sell_result = await self._try_place_sell_order(symbol, total_balance, target_price_sell, profit_percent, bot)
             
             if sell_result['success']:
                 result['sell_order_id'] = sell_result['order_id']
@@ -3478,7 +3522,10 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            sell_qty = self.bybit._round_quantity_by_step(available_qty, qty_step, min_qty)
+            # Используем ВЕСЬ доступный баланс
+            sell_qty = self.bybit._round_quantity_for_order(available_qty, qty_step, min_qty, force_min=False)
+            if sell_qty <= 0:
+                sell_qty = self.bybit._round_quantity_for_order(available_qty, qty_step, min_qty, force_min=True)
             
             if sell_qty < min_qty:
                 return {'success': False, 'error': f'Доступное количество ({available_qty:.6f}) меньше минимального ({min_qty})'}
@@ -3573,7 +3620,7 @@ class DCAStrategy:
                     await update.message.reply_text(msg, parse_mode='Markdown')
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': result.get('error'), 'message': msg}
             elif result.get('error') == 'quantity_decimals_error':
-                retry_qty = self.bybit._round_quantity_by_step(sell_qty, qty_step, min_qty)
+                retry_qty = self.bybit._round_quantity_for_order(sell_qty, qty_step, min_qty, force_min=True)
                 if retry_qty != sell_qty:
                     logger.info(f"Retrying with rounded quantity: {retry_qty}")
                     return await self.place_full_sell_order(update, symbol, profit_percent, auto_cancel_old=False)
