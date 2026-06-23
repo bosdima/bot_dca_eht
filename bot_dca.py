@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.2 (22.06.2026)
+Версия 5.6.3 (23.06.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлен метод get_balance (SPOT + UNIFIED)
-- Исправлена ошибка shutdown
-- Добавлена обработка ошибок баланса
+- Исправлен объем продажи - теперь продается ВСЯ позиция из статистики DCA
+- Добавлена проверка баланса перед продажей
+- Исправлено округление количества для продажи
 """
 
 import os
@@ -69,7 +69,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.2 (22.06.2026)"
+BOT_VERSION = "5.6.3 (23.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1959,11 +1959,6 @@ class BybitClient:
             
             rounded_quantity = self._round_quantity_by_step(quantity, qty_step, min_qty)
             
-            coin = symbol.replace('USDT', '')
-            balance = await self.get_balance(coin)
-            if balance and balance.get('equity', 0) < rounded_quantity:
-                rounded_quantity = self._round_quantity_by_step(balance.get('equity', 0), qty_step, min_qty)
-            
             if rounded_quantity < min_qty:
                 if rounded_quantity <= 0:
                     rounded_quantity = min_qty
@@ -2142,22 +2137,22 @@ class DCAStrategy:
         try:
             coin = symbol.replace('USDT', '')
             
-            balance_info = await self.bybit.get_balance(coin)
-            if not balance_info or 'equity' not in balance_info:
-                return {'success': False, 'error': 'Не удалось получить баланс'}
-            
-            current_balance = balance_info.get('equity', 0)
-            logger.info(f"Balance {coin}: {current_balance}")
-            
-            if current_balance <= 0:
+            # Получаем статистику DCA - ВЕСЬ накопленный объем
+            stats = self.db.get_dca_stats(symbol)
+            if not stats or stats['total_quantity'] <= 0:
+                error_msg = 'Нет статистики DCA для расчета цены'
                 if not silent:
-                    await self._send_no_sell_order_notification(
-                        symbol=symbol,
-                        reason=f'Нет монет {coin} на балансе для продажи',
-                        bot=bot
-                    )
-                return {'success': False, 'error': 'Нет монет для продажи'}
+                    await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
+                return {'success': False, 'error': error_msg}
             
+            total_quantity = stats['total_quantity']
+            avg_price = stats['avg_price']
+            profit_percent = float(self.db.get_setting('profit_percent', '5'))
+            target_price = avg_price * (1 + profit_percent / 100)
+            
+            logger.info(f"Total quantity for sell: {total_quantity} {coin}, Avg: {avg_price}, Target: {target_price} ({profit_percent}%)")
+            
+            # Проверяем, есть ли уже открытые ордера на продажу
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell_orders = [o for o in open_orders if o.get('side') == 'Sell']
             
@@ -2167,18 +2162,7 @@ class DCAStrategy:
             
             logger.info("No sell order found, creating new one...")
             
-            stats = self.db.get_dca_stats(symbol)
-            if not stats or stats['total_quantity'] <= 0:
-                error_msg = 'Нет статистики DCA для расчета цены'
-                await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
-                return {'success': False, 'error': error_msg}
-            
-            avg_price = stats['avg_price']
-            profit_percent = float(self.db.get_setting('profit_percent', '5'))
-            target_price = avg_price * (1 + profit_percent / 100)
-            
-            logger.info(f"Avg: {avg_price}, Target: {target_price} ({profit_percent}%)")
-            
+            # Получаем информацию о торговом инструменте
             instrument_info = await self.bybit.get_instrument_info(symbol)
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
@@ -2189,26 +2173,31 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            sell_quantity = self.bybit._round_quantity_by_step(current_balance, qty_step, min_qty)
+            # Используем ВЕСЬ объем из статистики DCA для продажи
+            sell_quantity = self.bybit._round_quantity_by_step(total_quantity, qty_step, min_qty)
             
+            # Проверяем, что объем соответствует минимальным требованиям
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
-                await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
+                if not silent:
+                    await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
             
             order_value = sell_quantity * rounded_price
             if order_value < min_amt:
                 needed_quantity = min_amt / rounded_price
                 needed_quantity = self.bybit._round_quantity_by_step(needed_quantity, qty_step, min_qty)
-                if needed_quantity <= current_balance:
+                if needed_quantity <= total_quantity:
                     sell_quantity = needed_quantity
                     order_value = sell_quantity * rounded_price
                     logger.info(f"Adjusted quantity: {sell_quantity} ({order_value:.2f} USDT)")
                 else:
                     error_msg = f'Сумма ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)'
-                    await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
+                    if not silent:
+                        await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                     return {'success': False, 'error': error_msg}
             
+            # Создаем ордер на продажу
             result = await self.bybit.place_limit_sell(symbol, sell_quantity, rounded_price)
             
             if result['success']:
@@ -2241,7 +2230,8 @@ class DCAStrategy:
                 }
             else:
                 error_msg = result.get('error', 'Неизвестная ошибка')
-                await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
+                if not silent:
+                    await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
                     
         except Exception as e:
@@ -2259,10 +2249,10 @@ class DCAStrategy:
                 
                 logger.info(f"Hourly check for {symbol} sell order...")
                 
-                coin = symbol.replace('USDT', '')
-                balance_info = await self.bybit.get_balance(coin)
-                if not balance_info or balance_info.get('equity', 0) <= 0:
-                    logger.info(f"No {coin} balance, skipping")
+                # Проверяем, есть ли статистика DCA
+                stats = self.db.get_dca_stats(symbol)
+                if not stats or stats['total_quantity'] <= 0:
+                    logger.info(f"No DCA stats for {symbol}, skipping")
                     continue
                 
                 open_orders = await self.bybit.get_open_orders(symbol)
@@ -2585,10 +2575,6 @@ class DCAStrategy:
         if cancelled_old > 0:
             logger.info(f"Cancelled {cancelled_old} old sell orders before new purchase")
         
-        coin = symbol.replace('USDT', '')
-        balance_before = await self.bybit.get_balance(coin)
-        quantity_before = balance_before.get('equity', 0) if balance_before else 0
-        
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
         if result['success']:
@@ -2614,26 +2600,23 @@ class DCAStrategy:
             
             await asyncio.sleep(3)
             
-            balance_after = await self.bybit.get_balance(coin)
-            total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
-            
-            logger.info(f"Balance before: {quantity_before:.8f} {coin}, after: {total_quantity_for_sell:.8f} {coin}")
-            
-            if total_quantity_for_sell <= 0:
-                logger.warning(f"No coins available for sell order after purchase")
-                result['sell_warning'] = f"⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
-                result['sell_skipped'] = True
-                result['amount_usdt'] = amount_usdt
-                result['drop_percent'] = drop_percent
-                return result
-            
+            # Получаем обновленную статистику DCA - ВЕСЬ объем для продажи
             updated_stats = self.db.get_dca_stats(symbol)
             if updated_stats and updated_stats['total_quantity'] > 0:
+                total_quantity_for_sell = updated_stats['total_quantity']
                 avg_price = updated_stats['avg_price']
                 target_price_sell = avg_price * (1 + profit_percent / 100)
-                logger.info(f"Target sell price calculated from avg price {avg_price}: {target_price_sell}")
+                logger.info(f"Total quantity for sell from stats: {total_quantity_for_sell}, Avg: {avg_price}, Target: {target_price_sell}")
             else:
+                total_quantity_for_sell = result['quantity']
                 target_price_sell = result['price'] * (1 + profit_percent / 100)
+                logger.info(f"Using purchase quantity for sell: {total_quantity_for_sell}")
+            
+            # Проверяем баланс для информации
+            coin = symbol.replace('USDT', '')
+            balance_after = await self.bybit.get_balance(coin)
+            balance_qty = balance_after.get('equity', 0) if balance_after else 0
+            logger.info(f"Balance after purchase: {balance_qty} {coin}, DCA total: {total_quantity_for_sell}")
             
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
@@ -2642,6 +2625,7 @@ class DCAStrategy:
                 await self.cancel_old_sell_orders(symbol)
                 await asyncio.sleep(2)
             
+            # Создаем ордер на продажу ВСЕГО объема
             sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell, target_price_sell, profit_percent, bot)
             
             if sell_result['success']:
@@ -2656,7 +2640,7 @@ class DCAStrategy:
                     quantity=sell_result['quantity'],
                     price=sell_result['price'],
                     profit_percent=profit_percent,
-                    avg_price=avg_price if updated_stats else result['price'],
+                    avg_price=updated_stats['avg_price'] if updated_stats else result['price'],
                     bot=bot
                 )
             elif sell_result.get('pending'):
@@ -2715,10 +2699,6 @@ class DCAStrategy:
         if cancelled_old > 0:
             logger.info(f"Cancelled {cancelled_old} old sell orders before new purchase")
         
-        coin = symbol.replace('USDT', '')
-        balance_before = await self.bybit.get_balance(coin)
-        quantity_before = balance_before.get('equity', 0) if balance_before else 0
-        
         result = await self.bybit.place_limit_buy(symbol, limit_price, amount_usdt, is_auto=True)
         
         if result['success']:
@@ -2735,49 +2715,48 @@ class DCAStrategy:
             
             await asyncio.sleep(3)
             
-            balance_after = await self.bybit.get_balance(coin)
-            total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
-            
-            if total_quantity_for_sell <= 0:
-                result['sell_warning'] = f"⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
-                result['sell_skipped'] = True
+            # Получаем обновленную статистику DCA - ВЕСЬ объем для продажи
+            updated_stats = self.db.get_dca_stats(symbol)
+            if updated_stats and updated_stats['total_quantity'] > 0:
+                total_quantity_for_sell = updated_stats['total_quantity']
+                avg_price = updated_stats['avg_price']
+                target_price_sell = avg_price * (1 + profit_percent / 100)
+                logger.info(f"Total quantity for sell from stats: {total_quantity_for_sell}, Avg: {avg_price}, Target: {target_price_sell}")
             else:
-                updated_stats = self.db.get_dca_stats(symbol)
-                if updated_stats and updated_stats['total_quantity'] > 0:
-                    avg_price = updated_stats['avg_price']
-                    target_price_sell = avg_price * (1 + profit_percent / 100)
-                else:
-                    target_price_sell = result['price'] * (1 + profit_percent / 100)
+                total_quantity_for_sell = result['quantity']
+                target_price_sell = result['price'] * (1 + profit_percent / 100)
+                logger.info(f"Using purchase quantity for sell: {total_quantity_for_sell}")
+            
+            open_orders = await self.bybit.get_open_orders(symbol)
+            existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
+            if existing_sell:
+                await self.cancel_old_sell_orders(symbol)
+                await asyncio.sleep(2)
+            
+            # Создаем ордер на продажу ВСЕГО объема
+            sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell, target_price_sell, profit_percent, bot)
+            
+            if sell_result['success']:
+                result['sell_order_id'] = sell_result['order_id']
+                result['target_price'] = sell_result['price']
+                result['sell_quantity'] = sell_result['quantity']
+                result['sell_order_placed'] = True
                 
-                open_orders = await self.bybit.get_open_orders(symbol)
-                existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
-                if existing_sell:
-                    await self.cancel_old_sell_orders(symbol)
-                    await asyncio.sleep(2)
-                
-                sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell, target_price_sell, profit_percent, bot)
-                
-                if sell_result['success']:
-                    result['sell_order_id'] = sell_result['order_id']
-                    result['target_price'] = sell_result['price']
-                    result['sell_quantity'] = sell_result['quantity']
-                    result['sell_order_placed'] = True
-                    
-                    await self._send_sell_order_notification(
-                        symbol=symbol,
-                        quantity=sell_result['quantity'],
-                        price=sell_result['price'],
-                        profit_percent=profit_percent,
-                        avg_price=updated_stats['avg_price'] if updated_stats else result['price'],
-                        bot=bot
-                    )
-                elif sell_result.get('pending'):
-                    result['pending_order_id'] = sell_result['pending_id']
-                    result['sell_warning'] = f"⚠️ Ордер на продажу отложен"
-                    result['sell_order_placed'] = False
-                else:
-                    result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
-                    result['sell_order_placed'] = False
+                await self._send_sell_order_notification(
+                    symbol=symbol,
+                    quantity=sell_result['quantity'],
+                    price=sell_result['price'],
+                    profit_percent=profit_percent,
+                    avg_price=updated_stats['avg_price'] if updated_stats else result['price'],
+                    bot=bot
+                )
+            elif sell_result.get('pending'):
+                result['pending_order_id'] = sell_result['pending_id']
+                result['sell_warning'] = f"⚠️ Ордер на продажу отложен"
+                result['sell_order_placed'] = False
+            else:
+                result['sell_warning'] = sell_result.get('error', 'Не удалось создать ордер на продажу')
+                result['sell_order_placed'] = False
             
             result['step_level'] = step_level
             result['amount_usdt'] = amount_usdt
@@ -3458,15 +3437,10 @@ class DCAStrategy:
                     else:
                         logger.warning("Не удалось отменить старые ордера, но продолжаем...")
             
-            balance_info = await self.bybit.get_balance(coin)
-            if not balance_info or 'equity' not in balance_info:
-                return {'success': False, 'error': 'Не удалось получить баланс монеты'}
-            
-            available_qty = balance_info['equity']
-            if available_qty <= 0:
-                return {'success': False, 'error': f'Доступный баланс {coin} равен 0.'}
-            
+            # Используем ВЕСЬ объем из статистики DCA
+            total_quantity = stats['total_quantity']
             avg_price = stats['avg_price']
+            
             raw_target_price = avg_price * (1 + profit_percent / 100)
             instrument_info = await self.bybit.get_instrument_info(symbol)
             tick_size = instrument_info['tick_size']
@@ -3478,10 +3452,10 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            sell_qty = self.bybit._round_quantity_by_step(available_qty, qty_step, min_qty)
+            sell_qty = self.bybit._round_quantity_by_step(total_quantity, qty_step, min_qty)
             
             if sell_qty < min_qty:
-                return {'success': False, 'error': f'Доступное количество ({available_qty:.6f}) меньше минимального ({min_qty})'}
+                return {'success': False, 'error': f'Количество ({total_quantity:.6f}) меньше минимального ({min_qty})'}
             
             order_value = sell_qty * rounded_price
             if order_value < min_amt:
@@ -5043,8 +5017,10 @@ class FastDCABot:
                 profit_percent = float(self.db.get_setting('profit_percent', '5'))
                 updated_stats = self.db.get_dca_stats(symbol)
                 if updated_stats and updated_stats['total_quantity'] > 0:
+                    total_quantity_for_sell = updated_stats['total_quantity']
                     target_price = updated_stats['avg_price'] * (1 + profit_percent / 100)
                 else:
+                    total_quantity_for_sell = result['quantity']
                     target_price = price * (1 + profit_percent / 100)
                 current_date = get_moscow_time_naive().strftime("%Y-%m-%d %H:%M:%S")
                 drop_percent = recommendation.get('drop_percent', 0) if recommendation.get('should_buy') else 0
@@ -5052,17 +5028,14 @@ class FastDCABot:
                 purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount, price=price, quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=current_date, order_id=result.get('order_id'))
                 if purchase_id:
                     await asyncio.sleep(2)
-                    coin = symbol.replace('USDT', '')
-                    balance_after = await self.bybit.get_balance(coin)
-                    total_qty = balance_after.get('equity', 0) if balance_after else result['quantity']
-                    sell_result = await self.bybit.place_limit_sell(symbol, total_qty, target_price)
+                    sell_result = await self.bybit.place_limit_sell(symbol, total_quantity_for_sell, target_price)
                     if sell_result['success']:
-                        self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=total_qty, target_price=target_price, profit_percent=profit_percent)
+                        self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=total_quantity_for_sell, target_price=target_price, profit_percent=profit_percent)
                     elif sell_result.get('error') == 'insufficient_balance':
-                        pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=total_qty, target_price=target_price, profit_percent=profit_percent)
+                        pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=total_quantity_for_sell, target_price=target_price, profit_percent=profit_percent)
                         await update.message.reply_text(f"⚠️ *ОРДЕР НА ПРОДАЖУ ОТЛОЖЕН*\n\nБаланс обновляется. Ордер будет автоматически создан позже.", parse_mode='Markdown')
                     elif sell_result.get('error') == 'min_amount_error':
-                        pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=total_qty, target_price=target_price, profit_percent=profit_percent)
+                        pending_id = self.db.add_pending_sell_order(symbol=symbol, quantity=total_quantity_for_sell, target_price=target_price, profit_percent=profit_percent)
                         await update.message.reply_text(f"⚠️ *ОРДЕР НА ПРОДАЖУ ОТЛОЖЕН*\n\nСумма ордера меньше минимальной.\n✅ Ордер сохранен и будет автоматически выставлен при достижении нужной цены.", parse_mode='Markdown')
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось создать ордер на продажу: {sell_result.get('error', 'Unknown')}")
