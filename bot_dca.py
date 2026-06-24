@@ -2,16 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.9 (24.06.2026)
-ИСПРАВЛЕНИЯ:
-- Исправлено: бот теперь продает ВЕСЬ доступный баланс (equity), а не только статистику DCA
-- Исправлено округление количества для продажи с шагом 0.00001 (5 знаков)
-- Исправлена проверка существующих ордеров на продажу по всем открытым ордерам
-- Добавлено автоматическое обновление ордера при изменении баланса
-- Исправлена логика определения "наших" ордеров по цене и количеству
-- Исправлено: принудительное использование equity вместо available для продажи
-- Исправлен send_sell_recommendation_from_callback - теперь использует фактический баланс
-- Исправлен handle_sell_confirmation - проверка актуального баланса перед продажей
+Версия 5.7.0 (24.06.2026)
+УПРОЩЕНИЕ:
+- Бот теперь всегда берет ФАКТИЧЕСКИЙ БАЛАНС монеты (equity) для продажи
+- НЕ использует статистику DCA для расчета количества
+- Простое округление до 5 знаков (шаг 0.00001)
+- Убрана сложная логика расчета количества из статистики
 """
 
 import os
@@ -75,7 +71,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.9 (24.06.2026)"
+BOT_VERSION = "5.7.0 (24.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1824,43 +1820,21 @@ class BybitClient:
     
     def _round_quantity_for_sell(self, quantity: float, qty_step: float, min_qty: float) -> float:
         """
-        Округление количества для продажи с использованием floor.
-        Округление до 5 знаков после запятой (шаг 0.00001) для ETHUSDT.
+        Простое округление количества для продажи до 5 знаков.
         """
-        # Принудительно используем 5 знаков для всех токенов
         decimal_places = 5
-        
-        # Используем floor для безопасного округления вниз
-        if qty_step > 0 and qty_step < 1:
-            rounded = math.floor(quantity / qty_step) * qty_step
-        else:
-            rounded = math.floor(quantity * 10**decimal_places) / 10**decimal_places
-        
-        # Проверяем минимальное количество
+        rounded = math.floor(quantity * 10**decimal_places) / 10**decimal_places
         if rounded < min_qty:
-            # Пробуем округлить вверх до минимума
             rounded = min_qty
             if rounded > quantity:
                 rounded = 0
-        
-        # Округляем до 5 знаков
         return round(rounded, decimal_places)
     
     def _round_quantity_for_buy(self, quantity: float, qty_step: float, min_qty: float) -> float:
-        """
-        Округление количества для покупки.
-        Для покупки используем округление вверх, чтобы гарантировать минимальную сумму.
-        """
         decimal_places = 5
-        
-        if qty_step > 0 and qty_step < 1:
-            rounded = math.ceil(quantity / qty_step) * qty_step
-        else:
-            rounded = math.ceil(quantity * 10**decimal_places) / 10**decimal_places
-        
+        rounded = math.ceil(quantity * 10**decimal_places) / 10**decimal_places
         if rounded < min_qty:
             rounded = min_qty
-        
         return round(rounded, decimal_places)
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
@@ -2157,6 +2131,7 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error sending purchase skipped notification: {e}")
     
+    # ============ УПРОЩЕННЫЙ МЕТОД - берет ФАКТИЧЕСКИЙ БАЛАНС ============
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
         try:
             coin = symbol.replace('USDT', '')
@@ -2173,7 +2148,7 @@ class DCAStrategy:
             profit_percent = float(self.db.get_setting('profit_percent', '5'))
             target_price = avg_price * (1 + profit_percent / 100)
             
-            # Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи
+            # Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты
             balance_info = await self.bybit.get_balance(coin)
             if not balance_info or 'equity' not in balance_info:
                 error_msg = 'Не удалось получить баланс монеты'
@@ -2181,18 +2156,18 @@ class DCAStrategy:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
             
-            # Используем equity (общий баланс) для продажи ВСЕХ монет
-            available_qty = balance_info.get('equity', 0)
+            # Берем equity (общий баланс) для продажи ВСЕХ монет
+            actual_balance = balance_info.get('equity', 0)
             
-            logger.info(f"Balance {coin}: available={balance_info.get('available', 0)}, equity={available_qty}, DCA total={stats['total_quantity']}")
+            logger.info(f"Balance {coin}: available={balance_info.get('available', 0)}, equity={actual_balance}")
             
-            if available_qty <= 0:
+            if actual_balance <= 0:
                 error_msg = f'Нет монет {coin} на балансе для продажи'
                 if not silent:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
             
-            logger.info(f"Balance {coin}: {available_qty}, Target: {target_price} ({profit_percent}%)")
+            logger.info(f"Balance {coin}: {actual_balance}, Target: {target_price} ({profit_percent}%)")
             
             # Проверяем, есть ли уже открытые ордера на продажу
             open_orders = await self.bybit.get_open_orders(symbol)
@@ -2214,10 +2189,10 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            # Используем ВЕСЬ БАЛАНС (equity) для продажи
-            sell_quantity = self.bybit._round_quantity_for_sell(available_qty, qty_step, min_qty)
+            # Используем ФАКТИЧЕСКИЙ БАЛАНС для продажи
+            sell_quantity = self.bybit._round_quantity_for_sell(actual_balance, qty_step, min_qty)
             
-            logger.info(f"Selling {sell_quantity} {coin} (available_qty={available_qty})")
+            logger.info(f"Selling {sell_quantity} {coin} (actual_balance={actual_balance})")
             
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
@@ -2226,7 +2201,7 @@ class DCAStrategy:
                 return {'success': False, 'error': error_msg}
             
             if sell_quantity <= 0:
-                error_msg = f'Недостаточно средств для продажи. Доступно: {available_qty} {coin}'
+                error_msg = f'Недостаточно средств для продажи. Доступно: {actual_balance} {coin}'
                 if not silent:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
@@ -2235,7 +2210,7 @@ class DCAStrategy:
             if order_value < min_amt:
                 needed_quantity = min_amt / rounded_price
                 needed_quantity = self.bybit._round_quantity_for_sell(needed_quantity, qty_step, min_qty)
-                if needed_quantity <= available_qty and needed_quantity > 0:
+                if needed_quantity <= actual_balance and needed_quantity > 0:
                     sell_quantity = needed_quantity
                     order_value = sell_quantity * rounded_price
                     logger.info(f"Adjusted quantity: {sell_quantity} ({order_value:.2f} USDT)")
@@ -2674,6 +2649,7 @@ class DCAStrategy:
             
             await asyncio.sleep(5)
             
+            # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
             coin = symbol.replace('USDT', '')
             balance_after = await self.bybit.get_balance(coin)
             total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
@@ -2687,7 +2663,7 @@ class DCAStrategy:
                 target_price_sell = result['price'] * (1 + profit_percent / 100)
                 logger.info(f"Using purchase price for target: {target_price_sell}")
             
-            logger.info(f"Balance for sell: {total_quantity_for_sell} {coin}, DCA total: {updated_stats['total_quantity'] if updated_stats else 0}")
+            logger.info(f"Balance for sell: {total_quantity_for_sell} {coin}")
             
             if total_quantity_for_sell <= 0:
                 logger.warning(f"No coins available for sell order after purchase")
@@ -2793,6 +2769,7 @@ class DCAStrategy:
             
             await asyncio.sleep(5)
             
+            # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
             coin = symbol.replace('USDT', '')
             balance_after = await self.bybit.get_balance(coin)
             total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
@@ -2806,7 +2783,7 @@ class DCAStrategy:
                 target_price_sell = result['price'] * (1 + profit_percent / 100)
                 logger.info(f"Using purchase price for target: {target_price_sell}")
             
-            logger.info(f"Balance for sell: {total_quantity_for_sell} {coin}, DCA total: {updated_stats['total_quantity'] if updated_stats else 0}")
+            logger.info(f"Balance for sell: {total_quantity_for_sell} {coin}")
             
             if total_quantity_for_sell <= 0:
                 result['sell_warning'] = f"⚠️ Монеты не зачислены на баланс. Ордер на продажу не создан."
@@ -3497,6 +3474,7 @@ class DCAStrategy:
             'check_date': check_date
         }
     
+    # ============ УПРОЩЕННЫЙ МЕТОД - берет ФАКТИЧЕСКИЙ БАЛАНС ============
     async def place_full_sell_order(self, update, symbol: str, profit_percent: float, auto_cancel_old: bool = True) -> Dict:
         try:
             stats = self.db.get_dca_stats(symbol)
@@ -3521,13 +3499,15 @@ class DCAStrategy:
                     else:
                         logger.warning("Не удалось отменить старые ордера, но продолжаем...")
             
+            # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
             balance_info = await self.bybit.get_balance(coin)
             if not balance_info or 'equity' not in balance_info:
                 return {'success': False, 'error': 'Не удалось получить баланс монеты'}
             
-            available_qty = balance_info.get('equity', 0)
+            actual_balance = balance_info.get('equity', 0)
+            logger.info(f"Actual balance for {coin}: {actual_balance}")
             
-            if available_qty <= 0:
+            if actual_balance <= 0:
                 return {'success': False, 'error': f'Доступный баланс {coin} равен 0.'}
             
             avg_price = stats['avg_price']
@@ -3542,13 +3522,15 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            sell_qty = self.bybit._round_quantity_for_sell(available_qty, qty_step, min_qty)
+            # Используем ФАКТИЧЕСКИЙ БАЛАНС для продажи
+            sell_qty = self.bybit._round_quantity_for_sell(actual_balance, qty_step, min_qty)
+            logger.info(f"Selling {sell_qty} {coin} (actual_balance={actual_balance})")
             
             if sell_qty <= 0:
-                return {'success': False, 'error': f'Недостаточно средств для продажи. Доступно: {available_qty:.8f} {coin}'}
+                return {'success': False, 'error': f'Недостаточно средств для продажи. Доступно: {actual_balance:.8f} {coin}'}
             
             if sell_qty < min_qty:
-                return {'success': False, 'error': f'Доступное количество ({available_qty:.8f}) меньше минимального ({min_qty})'}
+                return {'success': False, 'error': f'Доступное количество ({actual_balance:.8f}) меньше минимального ({min_qty})'}
             
             order_value = sell_qty * rounded_price
             if order_value < min_amt:
@@ -3559,7 +3541,6 @@ class DCAStrategy:
                     profit_percent=profit_percent,
                     fail_reason=f'Сумма ордера ({order_value:.2f} USDT) меньше минимальной ({min_amt} USDT)'
                 )
-                required_price = min_amt / sell_qty
                 msg = (f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
                        f"🪙 Токен: `{symbol}`\n"
                        f"📊 Количество: `{format_quantity(sell_qty, 5)}` {coin}\n"
@@ -3608,7 +3589,6 @@ class DCAStrategy:
                     profit_percent=profit_percent,
                     fail_reason=f'Минимальная сумма ордера: {min_amt} USDT'
                 )
-                required_price = min_amt / sell_qty
                 msg = (f"⏳ *ОРДЕР ОТЛОЖЕН*\n\n"
                        f"🪙 Токен: `{symbol}`\n"
                        f"📊 Количество: `{format_quantity(sell_qty, 5)}` {coin}\n"
@@ -4206,7 +4186,6 @@ class FastDCABot:
             await self._reset_bot_state(context)
             await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
     
-    # ============ ИСПРАВЛЕННЫЙ МЕТОД ============
     async def handle_sell_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -5757,7 +5736,6 @@ class FastDCABot:
             
             await asyncio.sleep(60)
     
-    # ============ ИСПРАВЛЕННЫЙ МЕТОД ============
     async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = self.db.get_setting('symbol', 'TONUSDT')
         profit_percent = float(self.db.get_setting('profit_percent', '5'))
@@ -5777,7 +5755,7 @@ class FastDCABot:
             rounded_price = tick_size
         coin = symbol.replace('USDT', '')
         
-        # ===== ВАЖНО: Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи =====
+        # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
         balance_info = await self.bybit.get_balance(coin)
         total_quantity = balance_info.get('equity', 0) if balance_info else 0
         
