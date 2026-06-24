@@ -376,7 +376,7 @@ class Database:
                 ('profit_percent', '5'),
                 ('max_drop_percent', '80'),
                 ('max_multiplier', '3'),
-                ('schedule_time', '09:00'),
+                ('schedule_time', '05:00'),
                 ('frequency_hours', '24'),
                 ('price_alert_enabled', 'false'),
                 ('dca_active', 'false'),
@@ -3772,7 +3772,7 @@ class FastDCABot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     def get_auto_dca_keyboard(self):
-        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        schedule_time = self.db.get_setting('schedule_time', '05:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
         invest_amount = self.db.get_setting('invest_amount', '5.0')
         keyboard = [
@@ -3878,7 +3878,7 @@ class FastDCABot:
         return ConversationHandler.END
     
     def _calculate_next_purchase_time(self) -> datetime:
-        schedule_time_str = self.db.get_setting('schedule_time', '09:00')
+        schedule_time_str = self.db.get_setting('schedule_time', '05:00')
         frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
         
         schedule_hour, schedule_minute = map(int, schedule_time_str.split(':'))
@@ -4050,7 +4050,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         await self._reset_bot_state(context)
-        schedule_time = self.db.get_setting('schedule_time', '09:00')
+        schedule_time = self.db.get_setting('schedule_time', '05:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
         invest_amount = self.db.get_setting('invest_amount', '5.0')
         await update.message.reply_text(
@@ -4090,7 +4090,7 @@ class FastDCABot:
             return SET_AMOUNT
     
     async def set_time_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
+        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '05:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
         return SET_SCHEDULE_TIME
     
     async def set_time_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
