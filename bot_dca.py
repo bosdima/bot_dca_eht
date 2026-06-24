@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.7 (24.06.2026)
+Версия 5.6.8 (24.06.2026)
 ИСПРАВЛЕНИЯ:
+- Исправлено: бот теперь продает ВЕСЬ доступный баланс (equity), а не только статистику DCA
 - Исправлено округление количества для продажи с шагом 0.00001 (5 знаков)
-- Продажа всего доступного баланса, а не только статистики DCA
 - Исправлена проверка существующих ордеров на продажу по всем открытым ордерам
 - Добавлено автоматическое обновление ордера при изменении баланса
 - Исправлена логика определения "наших" ордеров по цене и количеству
+- Исправлено: принудительное использование equity вместо available для продажи
 """
 
 import os
@@ -72,7 +73,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.7 (24.06.2026)"
+BOT_VERSION = "5.6.8 (24.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -141,7 +142,7 @@ def format_price(price: float, decimals: int = 4) -> str:
     if price is None: return "N/A"
     return f"{price:.{decimals}f}"
 
-def format_quantity(qty: float, decimals: int = 8) -> str:
+def format_quantity(qty: float, decimals: int = 5) -> str:
     if qty is None: return "N/A"
     return f"{qty:.{decimals}f}"
 
@@ -1824,13 +1825,11 @@ class BybitClient:
         Округление количества для продажи с использованием floor.
         Округление до 5 знаков после запятой (шаг 0.00001) для ETHUSDT.
         """
-        # Для ETHUSDT и большинства токенов шаг 0.00001 (5 знаков)
-        # Принудительно используем 5 знаков для ETHUSDT
+        # Принудительно используем 5 знаков для всех токенов
         decimal_places = 5
         
         # Используем floor для безопасного округления вниз
-        if qty_step > 0:
-            # Округляем до шага
+        if qty_step > 0 and qty_step < 1:
             rounded = math.floor(quantity / qty_step) * qty_step
         else:
             rounded = math.floor(quantity * 10**decimal_places) / 10**decimal_places
@@ -1852,7 +1851,7 @@ class BybitClient:
         """
         decimal_places = 5
         
-        if qty_step > 0:
+        if qty_step > 0 and qty_step < 1:
             rounded = math.ceil(quantity / qty_step) * qty_step
         else:
             rounded = math.ceil(quantity * 10**decimal_places) / 10**decimal_places
@@ -2156,6 +2155,7 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error sending purchase skipped notification: {e}")
     
+    # ============ ОСНОВНОЕ ИСПРАВЛЕНИЕ ============
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
         try:
             coin = symbol.replace('USDT', '')
@@ -2180,26 +2180,20 @@ class DCAStrategy:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
             
-            # Используем available (доступный баланс) или equity (общий баланс)
-            # На скриншоте available = 0.00996197, equity = 0.04996197
-            # Продаем ВЕСЬ ДОСТУПНЫЙ БАЛАНС (available)
-            available_qty = balance_info.get('available', 0)
-            equity_qty = balance_info.get('equity', 0)
+            # ===== ВАЖНО: Используем equity (общий баланс) для продажи ВСЕХ монет =====
+            # available - это свободный баланс, но он может быть меньше из-за открытых ордеров
+            # Для продажи используем equity, чтобы продать ВСЕ монеты на балансе
+            available_qty = balance_info.get('equity', 0)
             
-            # Если available = 0, используем equity
-            if available_qty <= 0 and equity_qty > 0:
-                available_qty = equity_qty
-                logger.info(f"Using equity instead of available: {equity_qty}")
-            
-            logger.info(f"Balance {coin}: available={available_qty}, equity={equity_qty}, DCA total={stats['total_quantity']}")
+            logger.info(f"Balance {coin}: available={balance_info.get('available', 0)}, equity={available_qty}, DCA total={stats['total_quantity']}")
             
             # Проверяем, совпадает ли баланс со статистикой
             stats_qty = stats['total_quantity']
-            if abs(equity_qty - stats_qty) > 0.00001:
-                logger.info(f"Balance ({equity_qty} {coin}) differs from DCA stats ({stats_qty} {coin})")
+            if abs(available_qty - stats_qty) > 0.00001:
+                logger.info(f"Balance ({available_qty} {coin}) differs from DCA stats ({stats_qty} {coin})")
             
             if available_qty <= 0:
-                error_msg = f'Нет доступных монет {coin} для продажи'
+                error_msg = f'Нет монет {coin} на балансе для продажи'
                 if not silent:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
@@ -2227,8 +2221,11 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            # Используем ВЕСЬ ДОСТУПНЫЙ БАЛАНС для продажи с безопасным округлением (floor)
+            # ===== ВАЖНО: Используем ВЕСЬ БАЛАНС (equity) для продажи =====
+            # НЕ используем stats['total_quantity'] для количества!
             sell_quantity = self.bybit._round_quantity_for_sell(available_qty, qty_step, min_qty)
+            
+            logger.info(f"Selling {sell_quantity} {coin} (available_qty={available_qty})")
             
             # Проверяем, что объем соответствует минимальным требованиям
             if sell_quantity < min_qty:
@@ -2291,7 +2288,6 @@ class DCAStrategy:
             else:
                 error_msg = result.get('error', 'Неизвестная ошибка')
                 if result.get('error') == 'insufficient_balance':
-                    # Сохраняем как отложенный ордер
                     pending_id = self.db.add_pending_sell_order(
                         symbol=symbol,
                         quantity=sell_quantity,
@@ -2691,13 +2687,11 @@ class DCAStrategy:
             # Ждем обновления баланса
             await asyncio.sleep(5)
             
-            # Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи
+            # ===== ВАЖНО: Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи =====
             coin = symbol.replace('USDT', '')
             balance_after = await self.bybit.get_balance(coin)
-            # Используем доступный баланс (available)
-            total_quantity_for_sell = balance_after.get('available', 0) if balance_after else 0
-            if total_quantity_for_sell <= 0:
-                total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
+            # Используем equity (общий баланс) для продажи ВСЕХ монет
+            total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
             
             # Обновленная статистика для расчета цены
             updated_stats = self.db.get_dca_stats(symbol)
@@ -2817,12 +2811,11 @@ class DCAStrategy:
             # Ждем обновления баланса
             await asyncio.sleep(5)
             
-            # Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи
+            # ===== ВАЖНО: Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи =====
             coin = symbol.replace('USDT', '')
             balance_after = await self.bybit.get_balance(coin)
-            total_quantity_for_sell = balance_after.get('available', 0) if balance_after else 0
-            if total_quantity_for_sell <= 0:
-                total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
+            # Используем equity (общий баланс) для продажи ВСЕХ монет
+            total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
             
             # Обновленная статистика для расчета цены
             updated_stats = self.db.get_dca_stats(symbol)
@@ -3555,10 +3548,8 @@ class DCAStrategy:
             if not balance_info or 'equity' not in balance_info:
                 return {'success': False, 'error': 'Не удалось получить баланс монеты'}
             
-            # Используем доступный баланс (available)
-            available_qty = balance_info.get('available', 0)
-            if available_qty <= 0:
-                available_qty = balance_info.get('equity', 0)
+            # ===== ВАЖНО: Используем equity (общий баланс) для продажи ВСЕХ монет =====
+            available_qty = balance_info.get('equity', 0)
             
             if available_qty <= 0:
                 return {'success': False, 'error': f'Доступный баланс {coin} равен 0.'}
@@ -5156,9 +5147,7 @@ class FastDCABot:
                     # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
                     coin = symbol.replace('USDT', '')
                     balance_after = await self.bybit.get_balance(coin)
-                    total_qty = balance_after.get('available', 0) if balance_after else 0
-                    if total_qty <= 0:
-                        total_qty = balance_after.get('equity', 0) if balance_after else result['quantity']
+                    total_qty = balance_after.get('equity', 0) if balance_after else result['quantity']
                     sell_result = await self.bybit.place_limit_sell(symbol, total_qty, target_price)
                     if sell_result['success']:
                         self.db.add_sell_order(symbol=symbol, order_id=sell_result['order_id'], quantity=total_qty, target_price=target_price, profit_percent=profit_percent)
@@ -5488,8 +5477,7 @@ class FastDCABot:
                 await update.message.reply_text("❌ Ошибка при удалении", reply_markup=self.get_main_keyboard())
                 await self._reset_bot_state(context)
                 return ConversationHandler.END
-        return EDIT_PURCHASE_SELECT
-    
+        return EDIT_PURCHASE_SELECT    
     async def show_purchase_after_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE, purchase_id):
         purchase = self.db.get_purchase_by_id(purchase_id)
         if not purchase:
