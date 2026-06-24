@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.6.8 (24.06.2026)
+Версия 5.6.9 (24.06.2026)
 ИСПРАВЛЕНИЯ:
 - Исправлено: бот теперь продает ВЕСЬ доступный баланс (equity), а не только статистику DCA
 - Исправлено округление количества для продажи с шагом 0.00001 (5 знаков)
@@ -10,6 +10,8 @@ DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
 - Добавлено автоматическое обновление ордера при изменении баланса
 - Исправлена логика определения "наших" ордеров по цене и количеству
 - Исправлено: принудительное использование equity вместо available для продажи
+- Исправлен send_sell_recommendation_from_callback - теперь использует фактический баланс
+- Исправлен handle_sell_confirmation - проверка актуального баланса перед продажей
 """
 
 import os
@@ -73,7 +75,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.6.8 (24.06.2026)"
+BOT_VERSION = "5.6.9 (24.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -376,7 +378,7 @@ class Database:
                 ('profit_percent', '5'),
                 ('max_drop_percent', '80'),
                 ('max_multiplier', '3'),
-                ('schedule_time', '05:00'),
+                ('schedule_time', '09:00'),
                 ('frequency_hours', '24'),
                 ('price_alert_enabled', 'false'),
                 ('dca_active', 'false'),
@@ -2155,7 +2157,6 @@ class DCAStrategy:
         except Exception as e:
             logger.error(f"Error sending purchase skipped notification: {e}")
     
-    # ============ ОСНОВНОЕ ИСПРАВЛЕНИЕ ============
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
         try:
             coin = symbol.replace('USDT', '')
@@ -2180,17 +2181,10 @@ class DCAStrategy:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                 return {'success': False, 'error': error_msg}
             
-            # ===== ВАЖНО: Используем equity (общий баланс) для продажи ВСЕХ монет =====
-            # available - это свободный баланс, но он может быть меньше из-за открытых ордеров
-            # Для продажи используем equity, чтобы продать ВСЕ монеты на балансе
+            # Используем equity (общий баланс) для продажи ВСЕХ монет
             available_qty = balance_info.get('equity', 0)
             
             logger.info(f"Balance {coin}: available={balance_info.get('available', 0)}, equity={available_qty}, DCA total={stats['total_quantity']}")
-            
-            # Проверяем, совпадает ли баланс со статистикой
-            stats_qty = stats['total_quantity']
-            if abs(available_qty - stats_qty) > 0.00001:
-                logger.info(f"Balance ({available_qty} {coin}) differs from DCA stats ({stats_qty} {coin})")
             
             if available_qty <= 0:
                 error_msg = f'Нет монет {coin} на балансе для продажи'
@@ -2210,7 +2204,6 @@ class DCAStrategy:
             
             logger.info("No sell order found, creating new one...")
             
-            # Получаем информацию о торговом инструменте
             instrument_info = await self.bybit.get_instrument_info(symbol)
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
@@ -2221,13 +2214,11 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            # ===== ВАЖНО: Используем ВЕСЬ БАЛАНС (equity) для продажи =====
-            # НЕ используем stats['total_quantity'] для количества!
+            # Используем ВЕСЬ БАЛАНС (equity) для продажи
             sell_quantity = self.bybit._round_quantity_for_sell(available_qty, qty_step, min_qty)
             
             logger.info(f"Selling {sell_quantity} {coin} (available_qty={available_qty})")
             
-            # Проверяем, что объем соответствует минимальным требованиям
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
                 if not silent:
@@ -2254,7 +2245,6 @@ class DCAStrategy:
                         await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
                     return {'success': False, 'error': error_msg}
             
-            # Создаем ордер на продажу
             result = await self.bybit.place_limit_sell(symbol, sell_quantity, rounded_price)
             
             if result['success']:
@@ -2322,7 +2312,6 @@ class DCAStrategy:
                 
                 logger.info(f"Hourly check for {symbol} sell order...")
                 
-                # Проверяем, есть ли статистика DCA
                 stats = self.db.get_dca_stats(symbol)
                 if not stats or stats['total_quantity'] <= 0:
                     logger.info(f"No DCA stats for {symbol}, skipping")
@@ -2384,7 +2373,6 @@ class DCAStrategy:
         qty_step = instrument_info['qty_step']
         tick_size = instrument_info['tick_size']
         
-        # Используем безопасное округление для продажи
         rounded_quantity = self.bybit._round_quantity_for_sell(quantity, qty_step, min_qty)
         
         if rounded_quantity <= 0:
@@ -2684,16 +2672,12 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
-            # Ждем обновления баланса
             await asyncio.sleep(5)
             
-            # ===== ВАЖНО: Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи =====
             coin = symbol.replace('USDT', '')
             balance_after = await self.bybit.get_balance(coin)
-            # Используем equity (общий баланс) для продажи ВСЕХ монет
             total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
             
-            # Обновленная статистика для расчета цены
             updated_stats = self.db.get_dca_stats(symbol)
             if updated_stats and updated_stats['total_quantity'] > 0:
                 avg_price = updated_stats['avg_price']
@@ -2720,7 +2704,6 @@ class DCAStrategy:
                 await self.cancel_old_sell_orders(symbol)
                 await asyncio.sleep(2)
             
-            # Создаем ордер на продажу, используя ВЕСЬ ДОСТУПНЫЙ БАЛАНС с безопасным округлением
             sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell, target_price_sell, profit_percent, bot)
             
             if sell_result['success']:
@@ -2808,16 +2791,12 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
-            # Ждем обновления баланса
             await asyncio.sleep(5)
             
-            # ===== ВАЖНО: Получаем ФАКТИЧЕСКИЙ БАЛАНС монеты для продажи =====
             coin = symbol.replace('USDT', '')
             balance_after = await self.bybit.get_balance(coin)
-            # Используем equity (общий баланс) для продажи ВСЕХ монет
             total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
             
-            # Обновленная статистика для расчета цены
             updated_stats = self.db.get_dca_stats(symbol)
             if updated_stats and updated_stats['total_quantity'] > 0:
                 avg_price = updated_stats['avg_price']
@@ -2839,7 +2818,6 @@ class DCAStrategy:
                     await self.cancel_old_sell_orders(symbol)
                     await asyncio.sleep(2)
                 
-                # Создаем ордер на продажу, используя ВЕСЬ ДОСТУПНЫЙ БАЛАНС с безопасным округлением
                 sell_result = await self._try_place_sell_order(symbol, total_quantity_for_sell, target_price_sell, profit_percent, bot)
                 
                 if sell_result['success']:
@@ -3543,12 +3521,10 @@ class DCAStrategy:
                     else:
                         logger.warning("Не удалось отменить старые ордера, но продолжаем...")
             
-            # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
             balance_info = await self.bybit.get_balance(coin)
             if not balance_info or 'equity' not in balance_info:
                 return {'success': False, 'error': 'Не удалось получить баланс монеты'}
             
-            # ===== ВАЖНО: Используем equity (общий баланс) для продажи ВСЕХ монет =====
             available_qty = balance_info.get('equity', 0)
             
             if available_qty <= 0:
@@ -3566,7 +3542,6 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            # Используем безопасное округление для продажи
             sell_qty = self.bybit._round_quantity_for_sell(available_qty, qty_step, min_qty)
             
             if sell_qty <= 0:
@@ -3772,7 +3747,7 @@ class FastDCABot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     def get_auto_dca_keyboard(self):
-        schedule_time = self.db.get_setting('schedule_time', '05:00')
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
         invest_amount = self.db.get_setting('invest_amount', '5.0')
         keyboard = [
@@ -3878,7 +3853,7 @@ class FastDCABot:
         return ConversationHandler.END
     
     def _calculate_next_purchase_time(self) -> datetime:
-        schedule_time_str = self.db.get_setting('schedule_time', '05:00')
+        schedule_time_str = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
         
         schedule_hour, schedule_minute = map(int, schedule_time_str.split(':'))
@@ -4050,7 +4025,7 @@ class FastDCABot:
         if not await self._check_user_fast(update):
             return ConversationHandler.END
         await self._reset_bot_state(context)
-        schedule_time = self.db.get_setting('schedule_time', '05:00')
+        schedule_time = self.db.get_setting('schedule_time', '09:00')
         frequency_hours = self.db.get_setting('frequency_hours', '24')
         invest_amount = self.db.get_setting('invest_amount', '5.0')
         await update.message.reply_text(
@@ -4090,7 +4065,7 @@ class FastDCABot:
             return SET_AMOUNT
     
     async def set_time_start_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '05:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
+        await update.message.reply_text(f"⏰ Введите время (текущее: {self.db.get_setting('schedule_time', '09:00')}, формат ЧЧ:ММ):", reply_markup=self.get_cancel_keyboard())
         return SET_SCHEDULE_TIME
     
     async def set_time_done_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4231,6 +4206,7 @@ class FastDCABot:
             await self._reset_bot_state(context)
             await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
     
+    # ============ ИСПРАВЛЕННЫЙ МЕТОД ============
     async def handle_sell_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_user_fast(update):
             return
@@ -4243,6 +4219,21 @@ class FastDCABot:
             if not sell_data:
                 await update.message.reply_text("❌ Данные о продаже не найдены", reply_markup=self.get_main_keyboard())
                 return
+            
+            # Проверяем актуальный баланс перед продажей
+            symbol = sell_data['symbol']
+            coin = symbol.replace('USDT', '')
+            balance_info = await self.bybit.get_balance(coin)
+            if balance_info and balance_info.get('equity', 0) > 0:
+                instrument_info = await self.bybit.get_instrument_info(symbol)
+                min_qty = instrument_info['min_qty']
+                qty_step = instrument_info['qty_step']
+                actual_quantity = self.bybit._round_quantity_for_sell(balance_info['equity'], qty_step, min_qty)
+                if actual_quantity > 0 and actual_quantity != sell_data.get('total_quantity'):
+                    sell_data['total_quantity'] = actual_quantity
+                    sell_data['display_quantity'] = actual_quantity
+                    logger.info(f"Updated sell quantity from balance: {actual_quantity}")
+            
             await update.message.reply_text("⏳ Выставляю ордер на продажу...")
             self._init_bybit()
             if not self.bybit_initialized:
@@ -5144,7 +5135,6 @@ class FastDCABot:
                 purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount, price=price, quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=current_date, order_id=result.get('order_id'))
                 if purchase_id:
                     await asyncio.sleep(3)
-                    # Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи
                     coin = symbol.replace('USDT', '')
                     balance_after = await self.bybit.get_balance(coin)
                     total_qty = balance_after.get('equity', 0) if balance_after else result['quantity']
@@ -5477,7 +5467,8 @@ class FastDCABot:
                 await update.message.reply_text("❌ Ошибка при удалении", reply_markup=self.get_main_keyboard())
                 await self._reset_bot_state(context)
                 return ConversationHandler.END
-        return EDIT_PURCHASE_SELECT    
+        return EDIT_PURCHASE_SELECT
+    
     async def show_purchase_after_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE, purchase_id):
         purchase = self.db.get_purchase_by_id(purchase_id)
         if not purchase:
@@ -5766,6 +5757,57 @@ class FastDCABot:
             
             await asyncio.sleep(60)
     
+    # ============ ИСПРАВЛЕННЫЙ МЕТОД ============
+    async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        symbol = self.db.get_setting('symbol', 'TONUSDT')
+        profit_percent = float(self.db.get_setting('profit_percent', '5'))
+        stats = self.db.get_dca_stats(symbol)
+        if not stats:
+            await update.callback_query.message.reply_text("❌ Нет статистики покупок для расчета цены продажи.")
+            return
+        target_info = self.strategy.calculate_target_info(stats, profit_percent)
+        if not target_info:
+            await update.callback_query.message.reply_text("❌ Не удалось рассчитать целевую цену.")
+            return
+        raw_price = target_info['target_price']
+        instrument_info = await self.bybit.get_instrument_info(symbol)
+        tick_size = instrument_info['tick_size']
+        rounded_price = self.bybit._round_price_by_tick(raw_price, tick_size)
+        if rounded_price <= 0:
+            rounded_price = tick_size
+        coin = symbol.replace('USDT', '')
+        
+        # ===== ВАЖНО: Получаем ФАКТИЧЕСКИЙ БАЛАНС для продажи =====
+        balance_info = await self.bybit.get_balance(coin)
+        total_quantity = balance_info.get('equity', 0) if balance_info else 0
+        
+        if total_quantity <= 0:
+            await update.callback_query.message.reply_text(f"❌ Нет монет {coin} на балансе для продажи.")
+            return
+        
+        # Округляем количество до 5 знаков
+        min_qty = instrument_info['min_qty']
+        qty_step = instrument_info['qty_step']
+        display_quantity = self.bybit._round_quantity_for_sell(total_quantity, qty_step, min_qty)
+        
+        msg = (f"📊 *РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ*\n\n"
+               f"🪙 Токен: `{symbol}`\n"
+               f"💰 Количество для продажи: `{format_quantity(display_quantity, 5)}` {coin}\n"
+               f"📈 Целевая прибыль: `{profit_percent}%`\n"
+               f"💰 Цена продажи (расчетная): `{format_price(raw_price, 4)}` USDT\n"
+               f"💰 Цена продажи (округленная): `{format_price(rounded_price, 4)}` USDT\n"
+               f"📊 Прибыль: `{target_info['target_profit']:.2f}` USDT\n\n"
+               f"✅ *Выставить ордер на продажу по цене {format_price(rounded_price, 4)} USDT?*")
+        context.user_data['pending_sell_data'] = {
+            'total_quantity': display_quantity, 
+            'display_quantity': display_quantity, 
+            'rounded_price': rounded_price, 
+            'raw_price': raw_price, 
+            'profit_percent': profit_percent, 
+            'symbol': symbol
+        }
+        await update.callback_query.message.reply_text(msg, reply_markup=self.get_sell_confirmation_keyboard(), parse_mode='Markdown')
+    
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -5916,37 +5958,6 @@ class FastDCABot:
             await update.callback_query.edit_message_text("ℹ️ Ордер уже был добавлен в статистику ранее.")
         else:
             await update.callback_query.edit_message_text("❌ Ошибка при добавлении покупки в статистику.")
-    
-    async def send_sell_recommendation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        symbol = self.db.get_setting('symbol', 'TONUSDT')
-        profit_percent = float(self.db.get_setting('profit_percent', '5'))
-        stats = self.db.get_dca_stats(symbol)
-        if not stats:
-            await update.callback_query.message.reply_text("❌ Нет статистики покупок для расчета цены продажи.")
-            return
-        target_info = self.strategy.calculate_target_info(stats, profit_percent)
-        if not target_info:
-            await update.callback_query.message.reply_text("❌ Не удалось рассчитать целевую цену.")
-            return
-        raw_price = target_info['target_price']
-        instrument_info = await self.bybit.get_instrument_info(symbol)
-        tick_size = instrument_info['tick_size']
-        rounded_price = self.bybit._round_price_by_tick(raw_price, tick_size)
-        if rounded_price <= 0:
-            rounded_price = tick_size
-        coin = symbol.replace('USDT', '')
-        total_quantity = stats['total_quantity']
-        display_quantity = total_quantity
-        msg = (f"📊 *РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ*\n\n"
-               f"🪙 Токен: `{symbol}`\n"
-               f"💰 Количество для продажи: `{format_quantity(display_quantity, 5)}` {coin}\n"
-               f"📈 Целевая прибыль: `{profit_percent}%`\n"
-               f"💰 Цена продажи (расчетная): `{format_price(raw_price, 4)}` USDT\n"
-               f"💰 Цена продажи (округленная): `{format_price(rounded_price, 4)}` USDT\n"
-               f"📊 Прибыль: `{target_info['target_profit']:.2f}` USDT\n\n"
-               f"✅ *Выставить ордер на продажу по цене {format_price(rounded_price, 4)} USDT?*")
-        context.user_data['pending_sell_data'] = {'total_quantity': total_quantity, 'display_quantity': display_quantity, 'rounded_price': rounded_price, 'raw_price': raw_price, 'profit_percent': profit_percent, 'symbol': symbol}
-        await update.callback_query.message.reply_text(msg, reply_markup=self.get_sell_confirmation_keyboard(), parse_mode='Markdown')
     
     async def skip_executed_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: str):
         self.db.mark_order_as_skipped(order_id)
