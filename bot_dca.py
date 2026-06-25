@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.7.0 (24.06.2026)
-УПРОЩЕНИЕ:
-- Бот теперь всегда берет ФАКТИЧЕСКИЙ БАЛАНС монеты (equity) для продажи
-- НЕ использует статистику DCA для расчета количества
-- Простое округление до 5 знаков (шаг 0.00001)
-- Убрана сложная логика расчета количества из статистики
+Версия 5.8.0 (25.06.2026)
+ИСПРАВЛЕНИЕ:
+- Автоматическое определение количества знаков после запятой для каждой монеты
+- Использование qtyStep из instrument_info для точного округления
+- Универсальное округление для продажи и покупки с учетом правил биржи
 """
 
 import os
@@ -71,7 +70,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.7.0 (24.06.2026)"
+BOT_VERSION = "5.8.0 (25.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -1621,6 +1620,9 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
+        self._instrument_cache = {}
+        self._instrument_cache_time = {}
+        self._instrument_cache_ttl = 3600  # 1 час
         self._init_session()
     
     def _init_session(self):
@@ -1773,6 +1775,11 @@ class BybitClient:
             return []
     
     async def get_instrument_info(self, symbol: str) -> Dict:
+        """Получение информации о инструменте с кешированием"""
+        now = time.time()
+        if symbol in self._instrument_cache_time and now - self._instrument_cache_time.get(symbol, 0) < self._instrument_cache_ttl:
+            return self._instrument_cache.get(symbol, {})
+        
         try:
             if not self.session:
                 self._init_session()
@@ -1782,32 +1789,37 @@ class BybitClient:
                 lot_size_filter = info.get('lotSizeFilter', {})
                 price_filter = info.get('priceFilter', {})
                 
-                base_precision_str = lot_size_filter.get('basePrecision', '2')
-                try:
-                    base_precision = int(float(base_precision_str))
-                except (ValueError, TypeError):
-                    base_precision = 2
+                # Получаем qtyStep - это ключевой параметр для определения точности количества
+                qty_step_str = lot_size_filter.get('qtyStep', '0.01')
+                qty_step = float(qty_step_str)
                 
-                tick_size_str = price_filter.get('tickSize', '0.0001')
-                tick_size = float(tick_size_str)
+                # Определяем количество десятичных знаков из qtyStep
+                qty_decimals = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 2
                 
                 min_qty = float(lot_size_filter.get('minOrderQty', 0.01))
                 min_amt = float(lot_size_filter.get('minOrderAmt', 5))
                 
-                qty_step_str = lot_size_filter.get('qtyStep', '0.01')
-                qty_step = float(qty_step_str)
+                tick_size_str = price_filter.get('tickSize', '0.0001')
+                tick_size = float(tick_size_str)
+                price_decimals = len(str(tick_size).split('.')[-1]) if '.' in str(tick_size) else 4
                 
-                return {
+                result = {
                     'min_qty': min_qty,
                     'min_amt': min_amt,
                     'qty_step': qty_step,
+                    'qty_decimals': qty_decimals,
                     'tick_size': tick_size,
-                    'base_precision': base_precision,
+                    'price_decimals': price_decimals,
                 }
-            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+                
+                self._instrument_cache[symbol] = result
+                self._instrument_cache_time[symbol] = now
+                logger.info(f"Instrument info for {symbol}: qty_step={qty_step}, qty_decimals={qty_decimals}, tick_size={tick_size}")
+                return result
+            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'qty_decimals': 2, 'tick_size': 0.0001, 'price_decimals': 4}
         except Exception as e:
             logger.error(f"Error getting instrument info: {e}")
-            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'tick_size': 0.0001, 'base_precision': 2}
+            return {'min_qty': 0.01, 'min_amt': 5, 'qty_step': 0.01, 'qty_decimals': 2, 'tick_size': 0.0001, 'price_decimals': 4}
     
     def _round_price_by_tick(self, price: float, tick_size: float) -> float:
         if tick_size <= 0:
@@ -1818,24 +1830,58 @@ class BybitClient:
         decimal_places = len(str(tick_size).split('.')[-1]) if '.' in str(tick_size) else 4
         return round(rounded, decimal_places)
     
-    def _round_quantity_for_sell(self, quantity: float, qty_step: float, min_qty: float) -> float:
+    def _round_quantity_by_step(self, quantity: float, qty_step: float, min_qty: float, use_ceil: bool = False) -> float:
         """
-        Простое округление количества для продажи до 5 знаков.
+        Универсальное округление количества с учетом шага qtyStep.
+        
+        Args:
+            quantity: Исходное количество
+            qty_step: Шаг изменения количества (например 0.01, 0.001, 0.0001)
+            min_qty: Минимальное количество
+            use_ceil: True - округление вверх (для покупок), False - округление вниз (для продаж)
+        
+        Returns:
+            Округленное количество с правильным количеством знаков
         """
-        decimal_places = 5
-        rounded = math.floor(quantity * 10**decimal_places) / 10**decimal_places
+        if qty_step <= 0:
+            qty_step = 0.01
+        
+        # Определяем количество знаков из шага
+        qty_str = str(qty_step)
+        if '.' in qty_str:
+            decimals = len(qty_str.split('.')[-1])
+        else:
+            decimals = 0
+        
+        # Для XRP qty_step = 0.01 -> decimals = 2
+        # Для ETH/BTC qty_step = 0.001 или 0.0001 -> decimals = 3 или 4
+        
+        if use_ceil:
+            # Для покупок: округляем вверх до шага
+            rounded = math.ceil(quantity / qty_step) * qty_step
+        else:
+            # Для продаж: округляем вниз до шага
+            rounded = math.floor(quantity / qty_step) * qty_step
+        
         if rounded < min_qty:
-            rounded = min_qty
-            if rounded > quantity:
-                rounded = 0
-        return round(rounded, decimal_places)
+            if use_ceil:
+                # Для покупок: увеличиваем до минимума
+                rounded = math.ceil(min_qty / qty_step) * qty_step
+            else:
+                # Для продаж: если меньше минимума, то 0
+                if rounded < min_qty:
+                    rounded = 0
+        
+        # Округляем до нужного количества знаков
+        return round(rounded, decimals)
+    
+    def _round_quantity_for_sell(self, quantity: float, qty_step: float, min_qty: float) -> float:
+        """Округление для продажи (вниз, floor)"""
+        return self._round_quantity_by_step(quantity, qty_step, min_qty, use_ceil=False)
     
     def _round_quantity_for_buy(self, quantity: float, qty_step: float, min_qty: float) -> float:
-        decimal_places = 5
-        rounded = math.ceil(quantity * 10**decimal_places) / 10**decimal_places
-        if rounded < min_qty:
-            rounded = min_qty
-        return round(rounded, decimal_places)
+        """Округление для покупки (вверх, ceil)"""
+        return self._round_quantity_by_step(quantity, qty_step, min_qty, use_ceil=True)
     
     async def get_all_executed_orders(self, symbol: str, from_date: datetime = None) -> List[Dict]:
         try:
@@ -1950,12 +1996,18 @@ class BybitClient:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
+            qty_decimals = instrument_info['qty_decimals']
             tick_size = instrument_info['tick_size']
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            # Используем безопасное округление для продажи (floor, 5 знаков)
+            # Используем универсальное округление с учетом qty_step
             rounded_quantity = self._round_quantity_for_sell(quantity, qty_step, min_qty)
+            
+            # Дополнительная проверка: если количество все еще имеет слишком много знаков,
+            # принудительно обрезаем до нужного количества знаков
+            if rounded_quantity > 0:
+                rounded_quantity = round(rounded_quantity, qty_decimals)
             
             if rounded_quantity < min_qty:
                 return {'success': False, 'error': f'Минимальное количество: {min_qty} {symbol.replace("USDT", "")}'}
@@ -1967,7 +2019,7 @@ class BybitClient:
             if order_value < min_amt:
                 return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt, 'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
             
-            logger.info(f"Placing sell order: {rounded_quantity} {symbol} @ {rounded_price}")
+            logger.info(f"Placing sell order: {rounded_quantity} {symbol} @ {rounded_price} (decimals={qty_decimals})")
             
             response = self.session.place_order(
                 category="spot", symbol=symbol, side="Sell", orderType="Limit", 
@@ -1980,7 +2032,7 @@ class BybitClient:
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             if response['retCode'] == 170137:
-                return {'success': False, 'error': 'quantity_decimals_error', 'message': response['retMsg'], 'quantity': rounded_quantity}
+                return {'success': False, 'error': 'quantity_decimals_error', 'message': response['retMsg'], 'quantity': rounded_quantity, 'qty_decimals': qty_decimals}
             return {'success': False, 'error': f"{response['retMsg']} (Код: {response['retCode']})"}
         except Exception as e:
             logger.error(f"Error placing sell order: {e}")
@@ -1994,6 +2046,7 @@ class BybitClient:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             qty_step = instrument_info['qty_step']
+            qty_decimals = instrument_info['qty_decimals']
             tick_size = instrument_info['tick_size']
             
             rounded_price = self._round_price_by_tick(price, tick_size)
@@ -2009,6 +2062,10 @@ class BybitClient:
             quantity = amount_usdt / rounded_price
             
             rounded_quantity = self._round_quantity_for_buy(quantity, qty_step, min_qty)
+            
+            # Принудительно обрезаем до нужного количества знаков
+            if rounded_quantity > 0:
+                rounded_quantity = round(rounded_quantity, qty_decimals)
             
             order_value = rounded_quantity * rounded_price
             if order_value < min_amt:
@@ -2184,6 +2241,7 @@ class DCAStrategy:
             min_amt = instrument_info['min_amt']
             tick_size = instrument_info['tick_size']
             qty_step = instrument_info['qty_step']
+            qty_decimals = instrument_info['qty_decimals']
             
             rounded_price = self.bybit._round_price_by_tick(target_price, tick_size)
             if rounded_price <= 0:
@@ -2191,8 +2249,11 @@ class DCAStrategy:
             
             # Используем ФАКТИЧЕСКИЙ БАЛАНС для продажи
             sell_quantity = self.bybit._round_quantity_for_sell(actual_balance, qty_step, min_qty)
+            # Принудительно обрезаем до нужного количества знаков
+            if sell_quantity > 0:
+                sell_quantity = round(sell_quantity, qty_decimals)
             
-            logger.info(f"Selling {sell_quantity} {coin} (actual_balance={actual_balance})")
+            logger.info(f"Selling {sell_quantity} {coin} (actual_balance={actual_balance}, decimals={qty_decimals})")
             
             if sell_quantity < min_qty:
                 error_msg = f'Количество ({sell_quantity}) меньше минимального ({min_qty})'
@@ -2346,9 +2407,12 @@ class DCAStrategy:
         min_qty = instrument_info['min_qty']
         min_amt = instrument_info['min_amt']
         qty_step = instrument_info['qty_step']
+        qty_decimals = instrument_info['qty_decimals']
         tick_size = instrument_info['tick_size']
         
         rounded_quantity = self.bybit._round_quantity_for_sell(quantity, qty_step, min_qty)
+        if rounded_quantity > 0:
+            rounded_quantity = round(rounded_quantity, qty_decimals)
         
         if rounded_quantity <= 0:
             error_msg = f'Недостаточно средств для продажи. Доступно: {quantity} {symbol.replace("USDT", "")}'
@@ -3519,12 +3583,15 @@ class DCAStrategy:
                 rounded_price = tick_size
             
             qty_step = instrument_info['qty_step']
+            qty_decimals = instrument_info['qty_decimals']
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
             # Используем ФАКТИЧЕСКИЙ БАЛАНС для продажи
             sell_qty = self.bybit._round_quantity_for_sell(actual_balance, qty_step, min_qty)
-            logger.info(f"Selling {sell_qty} {coin} (actual_balance={actual_balance})")
+            if sell_qty > 0:
+                sell_qty = round(sell_qty, qty_decimals)
+            logger.info(f"Selling {sell_qty} {coin} (actual_balance={actual_balance}, decimals={qty_decimals})")
             
             if sell_qty <= 0:
                 return {'success': False, 'error': f'Недостаточно средств для продажи. Доступно: {actual_balance:.8f} {coin}'}
@@ -3554,7 +3621,7 @@ class DCAStrategy:
                 return {'success': False, 'pending': True, 'pending_id': pending_id, 'error': 'min_amount_error', 'message': msg}
             
             if update and hasattr(update, 'message'):
-                await update.message.reply_text(f"📤 Выставляю ордер на продажу {format_quantity(sell_qty, 5)} {coin} по {format_price(rounded_price, 4)} USDT...")
+                await update.message.reply_text(f"📤 Выставляю ордер на продажу {format_quantity(sell_qty, qty_decimals)} {coin} по {format_price(rounded_price, 4)} USDT...")
             
             result = await self.bybit.place_limit_sell(symbol, sell_qty, rounded_price)
             if result['success']:
@@ -3570,7 +3637,7 @@ class DCAStrategy:
                 warning_msg = ""
                 if sell_qty < stats['total_quantity']:
                     diff = stats['total_quantity'] - sell_qty
-                    warning_msg = f"\n⚠️ Продано только {format_quantity(sell_qty, 5)} из {format_quantity(stats['total_quantity'], 5)} {coin}."
+                    warning_msg = f"\n⚠️ Продано только {format_quantity(sell_qty, qty_decimals)} из {format_quantity(stats['total_quantity'], qty_decimals)} {coin}."
                 
                 return {
                     'success': True,
@@ -4207,7 +4274,10 @@ class FastDCABot:
                 instrument_info = await self.bybit.get_instrument_info(symbol)
                 min_qty = instrument_info['min_qty']
                 qty_step = instrument_info['qty_step']
+                qty_decimals = instrument_info['qty_decimals']
                 actual_quantity = self.bybit._round_quantity_for_sell(balance_info['equity'], qty_step, min_qty)
+                if actual_quantity > 0:
+                    actual_quantity = round(actual_quantity, qty_decimals)
                 if actual_quantity > 0 and actual_quantity != sell_data.get('total_quantity'):
                     sell_data['total_quantity'] = actual_quantity
                     sell_data['display_quantity'] = actual_quantity
@@ -4220,9 +4290,12 @@ class FastDCABot:
                 return
             result = await self.strategy.place_full_sell_order(update, sell_data['symbol'], sell_data['profit_percent'], auto_cancel_old=True)
             if result['success']:
+                # Получаем количество знаков для отображения
+                instrument_info = await self.bybit.get_instrument_info(sell_data['symbol'])
+                qty_decimals = instrument_info['qty_decimals']
                 msg = (f"✅ *Ордер на продажу успешно создан!*\n\n"
                        f"🪙 Токен: `{sell_data['symbol']}`\n"
-                       f"📊 Количество: `{format_quantity(result['quantity'], 5)}`\n"
+                       f"📊 Количество: `{format_quantity(result['quantity'], qty_decimals)}`\n"
                        f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
                        f"📈 Целевая прибыль: `{result['profit_percent']}%`\n"
                        f"🆔 ID ордера: `{result['order_id']}`\n"
@@ -4615,9 +4688,12 @@ class FastDCABot:
                     pnl_percent = 0
                     pnl_usd = 0
                 emoji = "🟢" if pnl_percent >= 0 else "🔴"
+                # Получаем количество знаков для отображения
+                instrument_info = await self.bybit.get_instrument_info(symbol)
+                qty_decimals = instrument_info['qty_decimals']
                 message += f"🪙 *{coin}*\n"
-                message += f"Всего: `{format_quantity(equity, 5)}`\n"
-                message += f"Доступно: `{format_quantity(available, 5)}`\n"
+                message += f"Всего: `{format_quantity(equity, qty_decimals)}`\n"
+                message += f"Доступно: `{format_quantity(available, qty_decimals)}`\n"
                 message += f"Стоимость: `{usd_value:.2f}` USDT\n"
                 message += f"Текущая цена: `{format_price(current_price, 4)}` USDT\n"
                 if avg_price > 0:
@@ -4653,9 +4729,12 @@ class FastDCABot:
             pnl = current_value - total_cost
             pnl_percent = (pnl / total_cost * 100) if total_cost > 0 else 0
             target_info = self.strategy.calculate_target_info(stats, profit_percent)
+            instrument_info = await self.bybit.get_instrument_info(symbol)
+            qty_decimals = instrument_info['qty_decimals']
+            
             text = f"📊 *ДЕТАЛЬНАЯ СТАТИСТИКА DCA*\n\n"
             text += f"🪙 Токен: `{symbol}`\n"
-            text += f"💰 Куплено: `{format_quantity(total_amount, 5)}` {coin}\n"
+            text += f"💰 Куплено: `{format_quantity(total_amount, qty_decimals)}` {coin}\n"
             text += f"💵 Инвестировано: `{total_cost:.2f}` USDT\n"
             text += f"📈 Средняя цена входа: `{format_price(avg_price, 4)}` USDT\n"
             if current_price:
@@ -4667,11 +4746,10 @@ class FastDCABot:
                 emoji = "📈" if pnl >= 0 else "📉"
                 text += f"{emoji} Текущий PnL: `{pnl:.2f}` USDT ({pnl_percent:+.2f}%)\n"
             if target_info:
-                instrument_info = await self.bybit.get_instrument_info(symbol)
                 tick_size = instrument_info['tick_size']
                 rounded_target = self.bybit._round_price_by_tick(target_info['target_price'], tick_size)
                 text += f"\n🎯 *ЦЕЛЕВАЯ ПРИБЫЛЬ {profit_percent}%:*\n"
-                text += f"Нужно продать: `{format_quantity(target_info['total_qty'], 5)}` {coin}\n"
+                text += f"Нужно продать: `{format_quantity(target_info['total_qty'], qty_decimals)}` {coin}\n"
                 text += f"Цена продажи: `{format_price(target_info['target_price'], 4)}` USDT\n"
                 text += f"Получите: `{target_info['target_value']:.2f}` USDT\n"
                 text += f"Прибыль: `{target_info['target_profit']:.2f}` USDT\n"
@@ -4903,13 +4981,16 @@ class FastDCABot:
         
         instrument_info = await self.bybit.get_instrument_info(symbol)
         min_amt = instrument_info['min_amt']
+        qty_decimals = instrument_info['qty_decimals']
+        tick_size = instrument_info['tick_size']
         
         self.db.set_setting('symbol', symbol)
         self.db.set_setting('initial_reference_price', str(price))
         await update.message.reply_text(
             f"✅ Символ изменен на {symbol}\n"
             f"💰 Текущая цена: {format_price(price, 4)} USDT\n"
-            f"⚠️ Минимальная сумма для Авто DCA: {min_amt} USDT",
+            f"⚠️ Минимальная сумма для Авто DCA: {min_amt} USDT\n"
+            f"📊 Точность количества: {qty_decimals} знаков после запятой",
             reply_markup=self.get_settings_keyboard()
         )
         return SELECTING_ACTION
@@ -5763,14 +5844,17 @@ class FastDCABot:
             await update.callback_query.message.reply_text(f"❌ Нет монет {coin} на балансе для продажи.")
             return
         
-        # Округляем количество до 5 знаков
+        # Округляем количество с учетом qty_step
         min_qty = instrument_info['min_qty']
         qty_step = instrument_info['qty_step']
+        qty_decimals = instrument_info['qty_decimals']
         display_quantity = self.bybit._round_quantity_for_sell(total_quantity, qty_step, min_qty)
+        if display_quantity > 0:
+            display_quantity = round(display_quantity, qty_decimals)
         
         msg = (f"📊 *РЕКОМЕНДАЦИЯ ПО ПРОДАЖЕ*\n\n"
                f"🪙 Токен: `{symbol}`\n"
-               f"💰 Количество для продажи: `{format_quantity(display_quantity, 5)}` {coin}\n"
+               f"💰 Количество для продажи: `{format_quantity(display_quantity, qty_decimals)}` {coin}\n"
                f"📈 Целевая прибыль: `{profit_percent}%`\n"
                f"💰 Цена продажи (расчетная): `{format_price(raw_price, 4)}` USDT\n"
                f"💰 Цена продажи (округленная): `{format_price(rounded_price, 4)}` USDT\n"
