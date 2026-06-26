@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.11.0 (25.06.2026)
-ИСПРАВЛЕНИЕ:
-- Использование math.floor для округления вниз при продаже
-- Фиксированная точность 5 знаков для продажи с округлением вниз
-- Покупка использует qty_decimals из instrument_info
-- Универсальное округление для разных монет
+Версия 5.12.0 (26.06.2026)
+ИСПРАВЛЕНИЯ:
+- Исправлена работа с суб-аккаунтами Bybit (UNIFIED аккаунт)
+- Исправлена логика создания ордера на продажу - только при наличии покупок
+- Улучшена обработка баланса для разных типов аккаунтов
+- Исправлены ошибки при запуске DCA без истории покупок
 """
 
 import os
@@ -71,7 +71,7 @@ BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.11.0 (25.06.2026)"
+BOT_VERSION = "5.12.0 (26.06.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 
@@ -377,7 +377,7 @@ class Database:
                 ('profit_percent', '5'),
                 ('max_drop_percent', '80'),
                 ('max_multiplier', '3'),
-                ('schedule_time', '09:00'),
+                ('schedule_time', '05:00'),
                 ('frequency_hours', '24'),
                 ('price_alert_enabled', 'false'),
                 ('dca_active', 'false'),
@@ -1673,39 +1673,15 @@ class BybitClient:
             return 0, []
     
     async def get_balance(self, coin: str = None) -> Dict:
-        """Получение баланса с поддержкой разных типов аккаунтов"""
+        """
+        Получение баланса с поддержкой UNIFIED аккаунтов (суб-аккаунты).
+        Bybit требует accountType="UNIFIED" для суб-аккаунтов.
+        """
         try:
             if not self.session:
                 self._init_session()
             
-            # Сначала пробуем SPOT (для обычных API ключей)
-            try:
-                response = self.session.get_wallet_balance(accountType="SPOT")
-                if response['retCode'] == 0:
-                    result_list = response['result']['list']
-                    if result_list:
-                        account_data = result_list[0]
-                        coins = account_data.get('coin', [])
-                        
-                        if coin:
-                            for c in coins:
-                                if c.get('coin') == coin:
-                                    wallet_balance = float(c.get('walletBalance', 0) or 0)
-                                    equity = float(c.get('equity', 0) or 0) or wallet_balance
-                                    locked = float(c.get('locked', 0) or 0)
-                                    available = wallet_balance - locked
-                                    usd_value = float(c.get('usdValue', 0) or 0)
-                                    logger.info(f"Balance for {coin}: available={available}, equity={equity}")
-                                    return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
-                            
-                            logger.warning(f"Coin {coin} not found in SPOT response")
-                        else:
-                            total_equity = float(account_data.get('totalEquity', 0) or 0)
-                            return {'total_equity': total_equity, 'coins': coins}
-            except Exception as e:
-                logger.warning(f"Error getting balance with SPOT: {e}")
-            
-            # Если SPOT не сработал, пробуем UNIFIED
+            # Пробуем UNIFIED (работает для всех аккаунтов, включая суб-аккаунты)
             try:
                 response = self.session.get_wallet_balance(accountType="UNIFIED")
                 if response['retCode'] == 0:
@@ -1726,11 +1702,37 @@ class BybitClient:
                                     return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
                             
                             logger.warning(f"Coin {coin} not found in UNIFIED response")
+                            # Если монета не найдена, возвращаем 0 баланс
+                            return {'coin': coin, 'equity': 0, 'available': 0, 'usdValue': 0}
                         else:
                             total_equity = float(account_data.get('totalEquity', 0) or 0)
                             return {'total_equity': total_equity, 'coins': coins}
             except Exception as e:
                 logger.warning(f"Error getting balance with UNIFIED: {e}")
+                # Если UNIFIED не сработал, пробуем SPOT
+                try:
+                    response = self.session.get_wallet_balance(accountType="SPOT")
+                    if response['retCode'] == 0:
+                        result_list = response['result']['list']
+                        if result_list:
+                            account_data = result_list[0]
+                            coins = account_data.get('coin', [])
+                            
+                            if coin:
+                                for c in coins:
+                                    if c.get('coin') == coin:
+                                        wallet_balance = float(c.get('walletBalance', 0) or 0)
+                                        equity = float(c.get('equity', 0) or 0) or wallet_balance
+                                        locked = float(c.get('locked', 0) or 0)
+                                        available = wallet_balance - locked
+                                        usd_value = float(c.get('usdValue', 0) or 0)
+                                        logger.info(f"Balance for {coin} (SPOT): available={available}, equity={equity}")
+                                        return {'coin': coin, 'equity': equity, 'available': available, 'usdValue': usd_value}
+                            else:
+                                total_equity = float(account_data.get('totalEquity', 0) or 0)
+                                return {'total_equity': total_equity, 'coins': coins}
+                except Exception as e2:
+                    logger.warning(f"Error getting balance with SPOT: {e2}")
             
             return {'error': 'Не удалось получить баланс'}
             
@@ -1793,11 +1795,9 @@ class BybitClient:
                 lot_size_filter = info.get('lotSizeFilter', {})
                 price_filter = info.get('priceFilter', {})
                 
-                # Получаем qtyStep - это ключевой параметр для определения точности количества
                 qty_step_str = lot_size_filter.get('qtyStep', '0.01')
                 qty_step = float(qty_step_str)
                 
-                # Определяем количество десятичных знаков из qtyStep
                 qty_decimals = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 2
                 
                 min_qty = float(lot_size_filter.get('minOrderQty', 0.01))
@@ -1835,7 +1835,6 @@ class BybitClient:
         return round(rounded, decimal_places)
     
     def _round_quantity_for_buy(self, quantity: float, qty_step: float, min_qty: float) -> float:
-        """Округление для покупки (вверх, ceil) с использованием qty_step"""
         if qty_step <= 0:
             qty_step = 0.01
         
@@ -1853,14 +1852,9 @@ class BybitClient:
         return round(rounded, decimals)
     
     def _round_quantity_for_sell(self, quantity: float) -> float:
-        """
-        Округление для продажи с фиксированной точностью 5 знаков.
-        Используем floor (вниз) чтобы не превысить доступный баланс.
-        """
         if quantity <= 0:
             return 0.0
         
-        # Используем floor для округления вниз до 5 знаков
         factor = 10 ** SELL_DECIMALS
         rounded = math.floor(quantity * factor) / factor
         
@@ -1982,11 +1976,9 @@ class BybitClient:
             
             rounded_price = self._round_price_by_tick(price, tick_size)
             
-            # Округляем количество до 5 знаков для продажи ВСЕХ монет (вниз)
             rounded_quantity = self._round_quantity_for_sell(quantity)
             
             if rounded_quantity < min_qty and quantity >= min_qty:
-                # Если округлили меньше минимума, пробуем округлить с меньшей точностью
                 for decimals in range(SELL_DECIMALS - 1, 1, -1):
                     factor = 10 ** decimals
                     test_rounded = math.floor(quantity * factor) / factor
@@ -2017,7 +2009,6 @@ class BybitClient:
             if response['retCode'] == 170131:
                 return {'success': False, 'error': 'insufficient_balance', 'message': response['retMsg']}
             if response['retCode'] == 170137:
-                # Пробуем уменьшить точность
                 for decimals in range(SELL_DECIMALS - 1, 1, -1):
                     factor = 10 ** decimals
                     retry_quantity = math.floor(rounded_quantity * factor) / factor
@@ -2055,7 +2046,6 @@ class BybitClient:
             
             rounded_quantity = self._round_quantity_for_buy(quantity, qty_step, min_qty)
             
-            # Принудительно обрезаем до нужного количества знаков
             if rounded_quantity > 0:
                 rounded_quantity = round(rounded_quantity, qty_decimals)
             
@@ -2129,7 +2119,7 @@ class DCAStrategy:
             return
         
         message = (
-            f"⚠️ *ОРДЕР НА ПРОДАЖУ НЕ СОЗДАН*\n\n"
+            f"ℹ️ *ОРДЕР НА ПРОДАЖУ НЕ СОЗДАН*\n\n"
             f"🪙 Пара: `{symbol}`\n"
             f"❗ *Причина:*\n`{reason}`\n\n"
             f"🔄 Проверка будет выполнена через 1 час."
@@ -2181,15 +2171,19 @@ class DCAStrategy:
             logger.error(f"Error sending purchase skipped notification: {e}")
     
     async def check_and_create_sell_order(self, symbol: str, bot, silent: bool = False) -> Dict:
+        """Проверяет и создает ордер на продажу ТОЛЬКО если есть покупки"""
         try:
             coin = symbol.replace('USDT', '')
             
             stats = self.db.get_dca_stats(symbol)
+            
+            # Если нет покупок - не создаем ордер на продажу
             if not stats or stats['total_quantity'] <= 0:
-                error_msg = 'Нет статистики DCA для расчета цены'
+                error_msg = 'Нет статистики DCA для расчета цены (нет покупок)'
+                logger.info(f"No purchases for {symbol}, skipping sell order creation")
                 if not silent:
                     await self._send_no_sell_order_notification(symbol=symbol, reason=error_msg, bot=bot)
-                return {'success': False, 'error': error_msg}
+                return {'success': False, 'error': error_msg, 'no_purchases': True}
             
             avg_price = stats['avg_price']
             profit_percent = float(self.db.get_setting('profit_percent', '5'))
@@ -2232,10 +2226,8 @@ class DCAStrategy:
             if rounded_price <= 0:
                 rounded_price = tick_size
             
-            # Продаем ВЕСЬ баланс с точностью 5 знаков (округление вниз)
             sell_quantity = self.bybit._round_quantity_for_sell(actual_balance)
             
-            # Если после округления получилось меньше минимума, но баланс больше минимума
             if sell_quantity < min_qty and actual_balance >= min_qty:
                 for decimals in range(SELL_DECIMALS - 1, 1, -1):
                     factor = 10 ** decimals
@@ -2341,7 +2333,7 @@ class DCAStrategy:
                 
                 stats = self.db.get_dca_stats(symbol)
                 if not stats or stats['total_quantity'] <= 0:
-                    logger.info(f"No DCA stats for {symbol}, skipping")
+                    logger.info(f"No DCA stats for {symbol}, skipping sell order check (no purchases)")
                     continue
                 
                 open_orders = await self.bybit.get_open_orders(symbol)
@@ -2399,7 +2391,6 @@ class DCAStrategy:
         min_amt = instrument_info['min_amt']
         tick_size = instrument_info['tick_size']
         
-        # Округляем количество до 5 знаков для продажи ВСЕХ монет (вниз)
         rounded_quantity = self.bybit._round_quantity_for_sell(quantity)
         
         if rounded_quantity <= 0:
@@ -2533,7 +2524,6 @@ class DCAStrategy:
                 'reason': f'Минимальная сумма ордера: {min_amt} USDT'
             }
         elif result.get('error') == 'quantity_decimals_error':
-            # Пробуем уменьшить точность
             for decimals in range(SELL_DECIMALS - 1, 1, -1):
                 factor = 10 ** decimals
                 retry_quantity = math.floor(rounded_quantity * factor) / factor
@@ -3579,10 +3569,8 @@ class DCAStrategy:
             min_qty = instrument_info['min_qty']
             min_amt = instrument_info['min_amt']
             
-            # Продаем ВЕСЬ баланс с точностью 5 знаков (округление вниз)
             sell_qty = self.bybit._round_quantity_for_sell(actual_balance)
             
-            # Если после округления получилось меньше минимума, но баланс больше минимума
             if sell_qty < min_qty and actual_balance >= min_qty:
                 for decimals in range(SELL_DECIMALS - 1, 1, -1):
                     factor = 10 ** decimals
@@ -3902,7 +3890,7 @@ class FastDCABot:
         return ConversationHandler.END
     
     def _calculate_next_purchase_time(self) -> datetime:
-        schedule_time_str = self.db.get_setting('schedule_time', '09:00')
+        schedule_time_str = self.db.get_setting('schedule_time', '05:00')
         frequency_hours = int(self.db.get_setting('frequency_hours', '24'))
         
         schedule_hour, schedule_minute = map(int, schedule_time_str.split(':'))
@@ -4855,40 +4843,54 @@ class FastDCABot:
                 parse_mode='Markdown'
             )
             
-            result = await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
-            
-            if result.get('success'):
-                if result.get('message'):
-                    await update.message.reply_text(
-                        f"✅ *DCA ЗАПУЩЕН!*\n\n"
-                        f"🪙 Токен: `{symbol}`\n"
-                        f"📊 {result['message']}\n\n"
-                        f"⏰ Проверка ордера будет выполняться каждый час.\n"
-                        f"📈 Целевая прибыль: `{self.db.get_setting('profit_percent', '5')}%`",
-                        parse_mode='Markdown',
-                        reply_markup=self.get_main_keyboard()
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"✅ *DCA ЗАПУЩЕН!*\n\n"
-                        f"🪙 Токен: `{symbol}`\n"
-                        f"💰 Создан ордер на продажу!\n"
-                        f"📊 Количество: `{format_quantity(result['quantity'], SELL_DECIMALS)}`\n"
-                        f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
-                        f"📈 Прибыль: `{result['profit_percent']}%`\n\n"
-                        f"⏰ Проверка ордера будет выполняться каждый час.",
-                        parse_mode='Markdown',
-                        reply_markup=self.get_main_keyboard()
-                    )
-            else:
+            # Проверяем наличие покупок перед созданием ордера
+            stats = self.db.get_dca_stats(symbol)
+            if not stats or stats['total_quantity'] <= 0:
                 await update.message.reply_text(
-                    f"⚠️ *DCA ЗАПУЩЕН, НО ОРДЕР НЕ СОЗДАН*\n\n"
+                    f"✅ *DCA ЗАПУЩЕН!*\n\n"
                     f"🪙 Токен: `{symbol}`\n"
-                    f"❗ Причина: {result.get('error', 'Неизвестная ошибка')}\n\n"
-                    f"🔄 Бот будет проверять статус каждый час.",
+                    f"⚠️ *Нет покупок для создания ордера на продажу*\n\n"
+                    f"🔄 Бот будет ждать выполнения покупок по расписанию.\n"
+                    f"📈 Целевая прибыль: `{self.db.get_setting('profit_percent', '5')}%`\n\n"
+                    f"⏰ Следующая покупка по расписанию.",
                     parse_mode='Markdown',
                     reply_markup=self.get_main_keyboard()
                 )
+            else:
+                result = await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
+                
+                if result.get('success'):
+                    if result.get('message'):
+                        await update.message.reply_text(
+                            f"✅ *DCA ЗАПУЩЕН!*\n\n"
+                            f"🪙 Токен: `{symbol}`\n"
+                            f"📊 {result['message']}\n\n"
+                            f"⏰ Проверка ордера будет выполняться каждый час.\n"
+                            f"📈 Целевая прибыль: `{self.db.get_setting('profit_percent', '5')}%`",
+                            parse_mode='Markdown',
+                            reply_markup=self.get_main_keyboard()
+                        )
+                    else:
+                        await update.message.reply_text(
+                            f"✅ *DCA ЗАПУЩЕН!*\n\n"
+                            f"🪙 Токен: `{symbol}`\n"
+                            f"💰 Создан ордер на продажу!\n"
+                            f"📊 Количество: `{format_quantity(result['quantity'], SELL_DECIMALS)}`\n"
+                            f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
+                            f"📈 Прибыль: `{result['profit_percent']}%`\n\n"
+                            f"⏰ Проверка ордера будет выполняться каждый час.",
+                            parse_mode='Markdown',
+                            reply_markup=self.get_main_keyboard()
+                        )
+                else:
+                    await update.message.reply_text(
+                        f"⚠️ *DCA ЗАПУЩЕН, НО ОРДЕР НЕ СОЗДАН*\n\n"
+                        f"🪙 Токен: `{symbol}`\n"
+                        f"❗ Причина: {result.get('error', 'Неизвестная ошибка')}\n\n"
+                        f"🔄 Бот будет проверять статус каждый час.",
+                        parse_mode='Markdown',
+                        reply_markup=self.get_main_keyboard()
+                    )
             
             if self._sell_check_task is None or self._sell_check_task.done():
                 self._sell_check_task = asyncio.create_task(
@@ -6041,7 +6043,12 @@ class FastDCABot:
             symbol = self.db.get_setting('symbol', 'TONUSDT')
             self._init_bybit()
             if self.bybit_initialized and self.authorized_user_id:
-                await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
+                # Проверяем наличие покупок перед созданием ордера
+                stats = self.db.get_dca_stats(symbol)
+                if stats and stats['total_quantity'] > 0:
+                    await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
+                else:
+                    logger.info(f"No purchases for {symbol}, skipping sell order creation on init")
                 self._sell_check_task = asyncio.create_task(
                     self.strategy.sell_order_check_loop(symbol, self.authorized_user_id, self.application.bot)
                 )
