@@ -1265,7 +1265,7 @@ class Database:
         self.set_setting('order_execution_notify', 'true' if enabled else 'false')
     
     def get_order_check_interval(self) -> int:
-        return int(self.get_setting('order_check_interval_minutes', '5'))
+        return int(self.get_setting('order_check_interval_minutes', '60'))
     
     def set_order_check_interval(self, minutes: int):
         self.set_setting('order_check_interval_minutes', str(minutes))
