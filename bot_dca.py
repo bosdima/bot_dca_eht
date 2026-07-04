@@ -2,15 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.16.0 (04.07.2026)
+Версия 5.18.0 (04.07.2026)
 ИСПРАВЛЕНИЯ:
-- Исправлена ошибка подписи API Bybit (ErrCode: 10004)
-- Исправлена обработка Markdown в Telegram сообщениях
-- Улучшена обработка ошибок API
-- Настройки вынесены в начало файла для удобства
-- Исправлено: ожидание зачисления монет перед созданием ордера на продажу
-- Исправлено: убрана лишняя информация из статистики
-- Исправлено: добавлена версия бота и статус API в статус бота
+- Исправлена логика запуска DCA: проверка ордеров запускается только при наличии покупок
+- Исправлен sell_order_check_loop: завершается если нет покупок
+- Убраны лишние уведомления при запуске без покупок
+- Оптимизирована работа фоновых задач
 """
 
 import os
@@ -60,55 +57,37 @@ load_dotenv()
 # =============================================================================
 
 # --- 1. Токены (Основные параметры) ---
-# DEFAULT_SYMBOL - токен, с которым работает бот по умолчанию.
-# POPULAR_SYMBOLS - список популярных токенов для быстрого выбора в меню.
 DEFAULT_SYMBOL = "ETHUSDT"
 POPULAR_SYMBOLS = ["ETHUSDT", "GRAMUSDT", "XRPUSDT", "BTCUSDT"]
 
 # --- 2. Настройки Авто DCA ---
-# INVEST_AMOUNT: Сумма для автоматической покупки в USDT (минимум 5).
-# SCHEDULE_TIME: Время для автоматической покупки в формате ЧЧ:ММ (Московское время).
-# FREQUENCY_HOURS: Как часто выполнять покупку (в часах).
-INVEST_AMOUNT = 5.0          # Изменить: укажите нужную сумму (например, 10.0)
-SCHEDULE_TIME = "05:00"      # Изменить: укажите время (например, "06:00")
-FREQUENCY_HOURS = 24         # Изменить: укажите частоту (например, 12)
+INVEST_AMOUNT = 5.0
+SCHEDULE_TIME = "05:00"
+FREQUENCY_HOURS = 24
 
 # --- 3. Настройки лестницы Мартингейла ---
-# LADDER_BASE_AMOUNT: Базовая сумма для первого ордера.
-# LADDER_MAX_AMOUNT: Максимальная сумма для последнего уровня (рассчитывается как base * 3, но можно изменить).
-# LADDER_MAX_DEPTH: Максимальная глубина просадки в процентах (30-95%).
-LADDER_BASE_AMOUNT = 5.0     # Изменить: укажите базовую сумму
-LADDER_MAX_AMOUNT = 15.0     # Изменить: укажите максимальную сумму (рассчитывается как base * 3 по умолчанию)
-LADDER_MAX_DEPTH = 80        # Изменить: укажите глубину (например, 70)
+LADDER_BASE_AMOUNT = 5.0
+LADDER_MAX_AMOUNT = 15.0
+LADDER_MAX_DEPTH = 80
 
 # --- 4. Настройки торговли ---
-# PROFIT_PERCENT: Целевой процент прибыли для ордера на продажу.
-# TRADING_MODE: Режим торговли ('real' - реальный, 'demo' - демо-режим).
-# MANUAL_AMOUNT: Сумма для ручного ордера по умолчанию.
-PROFIT_PERCENT = 5           # Изменить: укажите процент прибыли (например, 7)
-TRADING_MODE = "real"        # Изменить: "real" или "demo"
-MANUAL_AMOUNT = 1.1          # Изменить: укажите сумму для ручного ордера (минимум 1.1)
+PROFIT_PERCENT = 5
+TRADING_MODE = "real"
+MANUAL_AMOUNT = 1.1
 
 # --- 5. Настройки уведомлений о покупке ---
-# PURCHASE_NOTIFY_ENABLED: Включить/выключить ежедневное уведомление о покупке.
-# PURCHASE_NOTIFY_TIME: Время отправки уведомления в формате ЧЧ:ММ (МСК).
-PURCHASE_NOTIFY_ENABLED = False   # Изменить: True (вкл) или False (выкл)
-PURCHASE_NOTIFY_TIME = "06:00"   # Изменить: укажите время (например, "07:00")
+PURCHASE_NOTIFY_ENABLED = False
+PURCHASE_NOTIFY_TIME = "06:00"
 
 # --- 6. Настройки отслеживания ордеров ---
-# ORDER_EXECUTION_NOTIFY: Включить/выключить уведомления об исполненных ордерах.
-# ORDER_CHECK_INTERVAL_MINUTES: Интервал проверки новых исполненных ордеров (в минутах).
-ORDER_EXECUTION_NOTIFY = True    # Изменить: True (вкл) или False (выкл)
-ORDER_CHECK_INTERVAL_MINUTES = 60 # Изменить: интервал в минутах (от 5 до 1440)
+ORDER_EXECUTION_NOTIFY = True
+ORDER_CHECK_INTERVAL_MINUTES = 60
 
 # --- 7. Настройки отслеживания продаж ---
-# SELL_TRACKING_ENABLED: Включить/выключить отслеживание выполненных продаж.
-SELL_TRACKING_ENABLED = True     # Изменить: True (вкл) или False (выкл)
+SELL_TRACKING_ENABLED = True
 
 # --- 8. Настройки API ---
-# BYBIT_TESTNET_DEFAULT: Использовать тестовую сеть Bybit (true/false).
-# API ключи загружаются из .env файла.
-BYBIT_TESTNET_DEFAULT = False    # Изменить: True (тестнет) или False (реальная сеть)
+BYBIT_TESTNET_DEFAULT = False
 
 # =============================================================================
 #               КОНЕЦ БЛОКА НАСТРОЕК (ДАЛЬШЕ НЕ РЕДАКТИРОВАТЬ)
@@ -131,7 +110,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-BOT_VERSION = "5.16.0 (04.07.2026)"
+BOT_VERSION = "5.18.0 (04.07.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -2046,7 +2025,6 @@ class BybitClient:
         return rounded
     
     async def wait_for_order_filled(self, symbol: str, order_id: str, timeout: int = 10, check_interval: float = 0.5) -> bool:
-        """Ожидает исполнения ордера на бирже"""
         try:
             start_time = time.time()
             while time.time() - start_time < timeout:
@@ -2302,6 +2280,8 @@ class DCAStrategy:
         self.db = db
         self.bybit = bybit
         self._pending_sell_retry_interval = 300
+        self._sell_check_loop_task = None
+        self._sell_check_loop_running = False
     
     async def _send_sell_order_notification(self, symbol: str, quantity: float, price: float, profit_percent: float, avg_price: float, bot):
         user_id = self.db.get_authorized_user_id()
@@ -2353,7 +2333,7 @@ class DCAStrategy:
             f"🪙 Пара: `{symbol}`\n"
             f"❗ Ордер на продажу был удален вручную.\n\n"
             f"🔄 Бот восстановит ордер автоматически.\n"
-            f"✅ Новый ордер будет создан с +5% прибыли."
+            f"✅ Новый ордер будет создан с {self.db.get_setting('profit_percent', str(PROFIT_PERCENT))}% прибыли."
         )
         
         await safe_send_message(bot, user_id, message, parse_mode='Markdown')
@@ -2525,20 +2505,36 @@ class DCAStrategy:
             return {'success': False, 'error': str(e)}
     
     async def sell_order_check_loop(self, symbol: str, user_id: int, bot):
+        """
+        Цикл проверки ордера на продажу.
+        Запускается ТОЛЬКО если есть покупки в статистике.
+        При отсутствии покупок - цикл завершается.
+        """
         logger.info(f"Sell order check loop started for {symbol} (every 1 hour)")
+        self._sell_check_loop_running = True
         
+        # Проверяем наличие покупок перед запуском
+        stats = self.db.get_dca_stats(symbol)
+        if not stats or stats['total_quantity'] <= 0:
+            logger.info(f"No purchases for {symbol}, stopping sell order check loop")
+            self._sell_check_loop_running = False
+            return
+        
+        # Создаем ордер на продажу если есть покупки
         await self.check_and_create_sell_order(symbol, bot, silent=False)
         
-        while True:
+        while self._sell_check_loop_running:
             try:
                 await asyncio.sleep(3600)
                 
-                logger.info(f"Hourly check for {symbol} sell order...")
-                
+                # ПРОВЕРКА: есть ли покупки в статистике
                 stats = self.db.get_dca_stats(symbol)
                 if not stats or stats['total_quantity'] <= 0:
-                    logger.info(f"No DCA stats for {symbol}, skipping sell order check (no purchases)")
-                    continue
+                    logger.info(f"No purchases for {symbol}, stopping sell order check loop")
+                    self._sell_check_loop_running = False
+                    break
+                
+                logger.info(f"Hourly check for {symbol} sell order...")
                 
                 open_orders = await self.bybit.get_open_orders(symbol)
                 existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
@@ -2552,10 +2548,17 @@ class DCAStrategy:
                 
             except asyncio.CancelledError:
                 logger.info("Sell order check loop cancelled")
+                self._sell_check_loop_running = False
                 break
             except Exception as e:
                 logger.error(f"Error in sell order check loop: {e}")
                 await asyncio.sleep(60)
+        
+        logger.info(f"Sell order check loop stopped for {symbol}")
+    
+    def stop_sell_check_loop(self):
+        """Останавливает цикл проверки ордеров"""
+        self._sell_check_loop_running = False
     
     async def cancel_old_sell_orders(self, symbol: str) -> int:
         try:
@@ -2901,22 +2904,20 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
-            # === ИСПРАВЛЕНИЕ 1: Ожидание зачисления монет ===
-            # Ждем, пока ордер будет исполнен (закрыт) на бирже
+            # Ожидание зачисления монет
             logger.info(f"Waiting for order {result['order_id']} to be filled...")
             order_filled = await self.bybit.wait_for_order_filled(symbol, result['order_id'], timeout=10, check_interval=0.5)
             
             if not order_filled:
                 logger.warning(f"Order {result['order_id']} not filled within timeout, proceeding anyway...")
             
-            # Несколько попыток получить баланс с задержкой
             coin = symbol.replace('USDT', '')
             total_quantity_for_sell = 0
             max_balance_retries = 5
             
             for attempt in range(max_balance_retries):
                 if attempt > 0:
-                    await asyncio.sleep(1)  # Ждем 1 секунду между попытками
+                    await asyncio.sleep(1)
                 
                 balance_after = await self.bybit.get_balance(coin)
                 total_quantity_for_sell = balance_after.get('equity', 0) if balance_after else 0
@@ -2934,8 +2935,6 @@ class DCAStrategy:
                 result['amount_usdt'] = amount_usdt
                 result['drop_percent'] = drop_percent
                 return result
-            
-            # === КОНЕЦ ИСПРАВЛЕНИЯ 1 ===
             
             updated_stats = self.db.get_dca_stats(symbol)
             if updated_stats and updated_stats['total_quantity'] > 0:
@@ -3050,7 +3049,7 @@ class DCAStrategy:
             self.db.set_setting('last_purchase_price', str(result['price']))
             self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
             
-            # === ИСПРАВЛЕНИЕ 1: Ожидание зачисления монет ===
+            # Ожидание зачисления монет
             logger.info(f"Waiting for order {result['order_id']} to be filled...")
             order_filled = await self.bybit.wait_for_order_filled(symbol, result['order_id'], timeout=10, check_interval=0.5)
             
@@ -3079,7 +3078,6 @@ class DCAStrategy:
                 result['sell_warning'] = f"⚠️ Баланс не обновился. Ордер на продажу не создан."
                 result['sell_skipped'] = True
                 return result
-            # === КОНЕЦ ИСПРАВЛЕНИЯ 1 ===
             
             updated_stats = self.db.get_dca_stats(symbol)
             if updated_stats and updated_stats['total_quantity'] > 0:
@@ -5117,7 +5115,6 @@ class FastDCABot:
             stats = self.db.get_dca_stats(symbol)
             current_price = await self.bybit.get_symbol_price(symbol)
             profit_percent = float(self.db.get_setting('profit_percent', str(PROFIT_PERCENT)))
-            # manual_amount = self.db.get_manual_amount()  # Убираем эту переменную
             if not stats:
                 await update.message.reply_text("📈 *Статистика DCA*\n\nПокупок пока нет.", parse_mode='Markdown')
                 return
@@ -5159,8 +5156,6 @@ class FastDCABot:
                 text += f"Глубина просадки: `{ladder_settings['max_depth']}%`\n"
                 text += f"Базовая сумма: `{ladder_settings['base_amount']}` USDT\n"
                 text += f"Максимальная сумма: `{ladder_settings['max_amount']}` USDT\n\n"
-            # Убираем строку с рекомендацией для ручного ордера
-            # text += f"💡 *Для ручного ордера:* рекомендуемая сумма `{manual_amount:.2f}` USDT"
             await update.message.reply_text(text, parse_mode='Markdown')
         except Exception as e:
             logger.error(f"Error in show_dca_stats_detailed: {e}")
@@ -5187,11 +5182,9 @@ class FastDCABot:
         mode = self.db.get_trading_mode()
         mode_text = "Демо-режим" if mode == 'demo' else "Обычный режим"
         
-        # Получаем статус API
         api_status = self.db.get_api_status()
         api_error = self.db.get_api_error_message()
         
-        # Проверяем API если прошло больше 6 часов с последней проверки
         last_api_check = self.db.get_last_api_check_time()
         if last_api_check is None or (get_moscow_time_naive() - last_api_check).total_seconds() > 21600:
             self._init_bybit()
@@ -5253,9 +5246,13 @@ class FastDCABot:
             return
         
         is_active = self.db.get_setting('dca_active', 'false') == 'true'
+        symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
         
         if is_active:
             self.db.set_setting('dca_active', 'false')
+            # Останавливаем цикл проверки ордеров
+            if self.strategy:
+                self.strategy.stop_sell_check_loop()
             if self._sell_check_task and not self._sell_check_task.done():
                 self._sell_check_task.cancel()
             await update.message.reply_text(
@@ -5267,7 +5264,6 @@ class FastDCABot:
             )
             logger.info("DCA stopped by user")
         else:
-            symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             current_price = await self.bybit.get_symbol_price(symbol)
             if not current_price:
                 await update.message.reply_text("❌ Не удалось получить цену")
@@ -5279,23 +5275,38 @@ class FastDCABot:
                 f"🔍 *ПРОВЕРКА СТАТУСА*\n\n"
                 f"🪙 Токен: `{symbol}`\n"
                 f"💰 Текущая цена: `{format_price(current_price, 4)}` USDT\n\n"
-                f"⏳ Проверяю баланс и наличие ордера на продажу...",
+                f"⏳ Проверяю наличие покупок в статистике...",
                 parse_mode='Markdown'
             )
             
             stats = self.db.get_dca_stats(symbol)
+            
+            # Проверяем наличие покупок
             if not stats or stats['total_quantity'] <= 0:
+                # Нет покупок - просто запускаем DCA без проверки ордеров
                 await update.message.reply_text(
                     f"✅ *DCA ЗАПУЩЕН!*\n\n"
                     f"🪙 Токен: `{symbol}`\n"
-                    f"⚠️ *Нет покупок для создания ордера на продажу*\n\n"
-                    f"🔄 Бот будет ждать выполнения покупок по расписанию.\n"
+                    f"📊 Покупок в статистике: `0`\n\n"
+                    f"🔄 Бот будет ждать выполнения первой покупки по расписанию.\n"
                     f"📈 Целевая прибыль: `{self.db.get_setting('profit_percent', str(PROFIT_PERCENT))}%`\n\n"
-                    f"⏰ Следующая покупка по расписанию.",
+                    f"⏰ Следующая покупка будет выполнена по расписанию.\n"
+                    f"💡 Как только появится первая покупка, бот автоматически создаст ордер на продажу.",
                     parse_mode='Markdown',
                     reply_markup=self.get_main_keyboard()
                 )
+                logger.info(f"DCA activated for {symbol} without purchases (waiting for first buy)")
             else:
+                # Есть покупки - создаем ордер на продажу и запускаем проверку
+                await update.message.reply_text(
+                    f"🔍 *ОБНАРУЖЕНЫ ПОКУПКИ!*\n\n"
+                    f"📊 Всего покупок: `{stats['total_purchases']}`\n"
+                    f"💰 Вложено: `{stats['total_usdt']:.2f}` USDT\n"
+                    f"📈 Средняя цена: `{format_price(stats['avg_price'], 4)}` USDT\n\n"
+                    f"⏳ Создаю ордер на продажу...",
+                    parse_mode='Markdown'
+                )
+                
                 result = await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
                 
                 if result.get('success'):
@@ -5304,8 +5315,8 @@ class FastDCABot:
                             f"✅ *DCA ЗАПУЩЕН!*\n\n"
                             f"🪙 Токен: `{symbol}`\n"
                             f"📊 {result['message']}\n\n"
-                            f"⏰ Проверка ордера будет выполняться каждый час.\n"
-                            f"📈 Целевая прибыль: `{self.db.get_setting('profit_percent', str(PROFIT_PERCENT))}%`",
+                            f"📈 Целевая прибыль: `{self.db.get_setting('profit_percent', str(PROFIT_PERCENT))}%`\n\n"
+                            f"🔄 Проверка ордера будет выполняться каждый час.",
                             parse_mode='Markdown',
                             reply_markup=self.get_main_keyboard()
                         )
@@ -5317,11 +5328,12 @@ class FastDCABot:
                             f"📊 Количество: `{format_quantity(result['quantity'], 5)}`\n"
                             f"💰 Цена: `{format_price(result['price'], 4)}` USDT\n"
                             f"📈 Прибыль: `{result['profit_percent']}%`\n\n"
-                            f"⏰ Проверка ордера будет выполняться каждый час.",
+                            f"🔄 Проверка ордера будет выполняться каждый час.",
                             parse_mode='Markdown',
                             reply_markup=self.get_main_keyboard()
                         )
                 else:
+                    # Если не удалось создать ордер, но покупки есть - все равно запускаем проверку
                     await update.message.reply_text(
                         f"⚠️ *DCA ЗАПУЩЕН, НО ОРДЕР НЕ СОЗДАН*\n\n"
                         f"🪙 Токен: `{symbol}`\n"
@@ -5330,12 +5342,13 @@ class FastDCABot:
                         parse_mode='Markdown',
                         reply_markup=self.get_main_keyboard()
                     )
-            
-            if self._sell_check_task is None or self._sell_check_task.done():
-                self._sell_check_task = asyncio.create_task(
-                    self.strategy.sell_order_check_loop(symbol, self.authorized_user_id, self.application.bot)
-                )
-                logger.info("Sell order check loop started")
+                
+                # Запускаем цикл проверки ордеров
+                if self._sell_check_task is None or self._sell_check_task.done():
+                    self._sell_check_task = asyncio.create_task(
+                        self.strategy.sell_order_check_loop(symbol, self.authorized_user_id, self.application.bot)
+                    )
+                    logger.info("Sell order check loop started")
             
             logger.info(f"DCA activated. Symbol: {symbol}")
     
@@ -5393,11 +5406,8 @@ class FastDCABot:
         if text == "✏️ Ввести свой токен":
             await update.message.reply_text("✏️ Введите символ токена (например: TONUSDT):", reply_markup=self.get_cancel_keyboard())
             return SET_SYMBOL_MANUAL
-        if text in POPULAR_SYMBOLS:
-            return await self._validate_and_set_symbol(update, text)
-        else:
-            await update.message.reply_text("❌ Неверный выбор.", reply_markup=self.get_symbol_selection_keyboard())
-            return SELECTING_SYMBOL
+        # Пробуем любой введенный символ
+        return await self._validate_and_set_symbol(update, text)
     
     async def set_symbol_manual(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = update.message.text.upper().strip()
@@ -5414,7 +5424,7 @@ class FastDCABot:
         
         price = await self.bybit.get_symbol_price(symbol)
         if not price:
-            await update.message.reply_text(f"❌ Символ {symbol} не найден.", reply_markup=self.get_symbol_selection_keyboard())
+            await update.message.reply_text(f"❌ Символ {symbol} не найден на Bybit.\nПроверьте правильность написания.", reply_markup=self.get_symbol_selection_keyboard())
             return SELECTING_SYMBOL
         
         instrument_info = await self.bybit.get_instrument_info(symbol)
@@ -5632,7 +5642,7 @@ class FastDCABot:
                 step_level = recommendation.get('step_level', 0) if recommendation.get('should_buy') else 0
                 purchase_id = self.db.add_purchase(symbol=symbol, amount_usdt=amount, price=price, quantity=result['quantity'], multiplier=1.0, drop_percent=drop_percent, step_level=step_level, date=current_date, order_id=result.get('order_id'))
                 if purchase_id:
-                    # === ИСПРАВЛЕНИЕ 1: Ожидание зачисления монет ===
+                    # Ожидание зачисления монет
                     logger.info(f"Waiting for order {result['order_id']} to be filled...")
                     await self.bybit.wait_for_order_filled(symbol, result['order_id'], timeout=10, check_interval=0.5)
                     
@@ -5652,7 +5662,6 @@ class FastDCABot:
                             break
                         else:
                             logger.warning(f"Попытка {attempt+1}/{max_balance_retries}: Баланс {coin} еще 0, ждем...")
-                    # === КОНЕЦ ИСПРАВЛЕНИЯ 1 ===
                     
                     if total_qty > 0:
                         sell_result = await self.bybit.place_limit_sell(symbol, total_qty, target_price)
@@ -6028,6 +6037,9 @@ class FastDCABot:
             await self.auto_dca_settings_menu(update, context)
         elif text == "💵 Сумма для ручного ордера":
             await self.set_manual_amount_start(update, context)
+        elif text in POPULAR_SYMBOLS:
+            # Если пользователь ввел символ напрямую
+            await self._validate_and_set_symbol(update, text)
         elif text in ["🏠 Главное меню", "🔙 Назад в меню", "🔙 Назад в настройки", "🔙 Назад к списку"]:
             await update.message.reply_text("Главное меню:", reply_markup=self.get_main_keyboard())
         else:
@@ -6501,23 +6513,29 @@ class FastDCABot:
         
         self.background_tasks = [task1, task2, task3, task4, task5, task6]
         
+        # Проверяем, нужно ли запускать проверку ордеров при старте
         if self.db.get_setting('dca_active', 'false') == 'true':
             symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
             if self.bybit_initialized and self.authorized_user_id:
                 stats = self.db.get_dca_stats(symbol)
+                # Запускаем проверку ордеров ТОЛЬКО если есть покупки
                 if stats and stats['total_quantity'] > 0:
                     await self.strategy.check_and_create_sell_order(symbol, self.application.bot, silent=False)
+                    self._sell_check_task = asyncio.create_task(
+                        self.strategy.sell_order_check_loop(symbol, self.authorized_user_id, self.application.bot)
+                    )
+                    logger.info("Sell order check loop started on init (purchases found)")
                 else:
-                    logger.info(f"No purchases for {symbol}, skipping sell order creation on init")
-                self._sell_check_task = asyncio.create_task(
-                    self.strategy.sell_order_check_loop(symbol, self.authorized_user_id, self.application.bot)
-                )
-                logger.info("Sell order check loop started on init")
+                    logger.info("No purchases found on init, sell order check loop not started")
     
     async def shutdown(self, application: Application):
         logger.info("Shutting down bot...")
         self.scheduler_running = False
         self._is_running = False
+        
+        # Останавливаем цикл проверки ордеров
+        if self.strategy:
+            self.strategy.stop_sell_check_loop()
         
         if self._sell_check_task and not self._sell_check_task.done():
             self._sell_check_task.cancel()
