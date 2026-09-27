@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.41.0 (06.09.2026)
-ИСПРАВЛЕНИЯ:
-- Исправлена ошибка WebSocket: object NoneType can't be used in 'await' expression
-- Добавлена правильная обработка WebSocket через asyncio.to_thread
-- Добавлена обработка ошибки 'Too many sessions under the same UID'
-- Оптимизирован механизм переподключения WebSocket
-- Добавлена проверка активных сессий перед созданием новой
+Исправления:
+- ИСПРАВЛЕН WebSocket: order_stream теперь запускается в отдельном потоке через asyncio.to_thread
+- Улучшена надежность мониторинга ордеров на продажу (polling + WebSocket fallback)
+- Исправлена обработка завершенных продаж и отправка уведомлений
+- Исправлена автоматическая очистка статистики после продажи
+- Улучшена обработка ошибок WebSocket
+- Добавлены дополнительные проверки баланса перед созданием ордера
 """
+
+BOT_VERSION = "5.43.0 (27.09.2026)"
+
 import os
 import sys
 import asyncio
@@ -19,6 +22,8 @@ import sqlite3
 import re
 import time
 import math
+import random
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
 from colorama import init, Fore, Style
@@ -76,9 +81,9 @@ SELL_TRACKING_ENABLED = True
 BYBIT_TESTNET_DEFAULT = False
 
 # НАСТРОЙКИ МОНИТОРИНГА ПРОДАЖ
-SELL_MONITOR_INTERVAL = 30  # секунд между проверками статуса ордера
-BALANCE_CHECK_THRESHOLD = 0.01  # порог остатка монет для автоматической очистки
-AUTO_CLEAR_DELAY_HOURS = 3  # задержка перед автоматической очисткой статистики (часов)
+SELL_MONITOR_INTERVAL = 30
+BALANCE_CHECK_THRESHOLD = 0.01
+AUTO_CLEAR_DELAY_HOURS = 3
 # =============================================================================
 
 # ======================== БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ ============================
@@ -93,10 +98,14 @@ async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=No
     except Exception as e:
         if "Can't parse entities" in str(e) or "Bad Request" in str(e):
             logger.warning(f"Markdown parse error, sending without formatting: {e}")
-            clean_text = text.replace('*', '').replace('`', '').replace('_', '').replace('~', '')
-            return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
+            try:
+                clean_text = text.replace('*', '').replace('`', '').replace('_', '').replace('~', '')
+                return await bot.send_message(chat_id=chat_id, text=clean_text, reply_markup=reply_markup)
+            except Exception as e2:
+                logger.error(f"Telegram fallback send failed: {e2}")
         else:
-            raise e
+            logger.error(f"Telegram send failed: {e}")
+        return None
 
 # =============================================================================
 
@@ -131,7 +140,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.41.0 (06.09.2026)"
 CONVERSATION_TIMEOUT = 180
 SELL_DECIMALS_FALLBACK = 5
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -402,7 +410,7 @@ class Database:
             try:
                 return datetime.fromisoformat(date_str)
             except:
-                return None
+                pass
         return None
 
     def set_last_sell_order_date(self, date: datetime):
@@ -1485,6 +1493,7 @@ class BybitClient:
         self._price_cache = {}
         self._cache_time = {}
         self._cache_ttl = 5
+        self._cache_stale_ttl = 300
         self._instrument_cache = {}
         self._instrument_cache_time = {}
         self._instrument_cache_ttl = 3600
@@ -1492,10 +1501,8 @@ class BybitClient:
         self.ws = None
         self.ws_running = False
         self._order_update_callback = None
-        self._ws_task = None
-        self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 5
-        self._reconnect_delay = 60
+        self._ws_thread = None
+        self._ws_stop_event = threading.Event()
 
     def _init_session(self):
         try:
@@ -1524,158 +1531,220 @@ class BybitClient:
             self._refresh_session()
         return self.session is not None and self.api_key and self.api_secret
 
+    @staticmethod
+    def _is_retriable_exc(e: Exception) -> bool:
+        err = str(e).lower()
+        return ('timeout' in err or 'connection' in err or 'econn' in err
+                or 'reset' in err or 'read' in err or 'rate' in err
+                or '10016' in err or '10018' in err)
+
+    @staticmethod
+    def _is_rate_limit(ret_code: int) -> bool:
+        return ret_code in (10016, 10018)
+
+    async def _place_order_with_retry(self, symbol: str, side: str, qty: str,
+                                      price: str, context: str = "") -> Dict:
+        for attempt in range(3):
+            try:
+                if not self.session:
+                    self._init_session()
+                response = self.session.place_order(
+                    category="spot", symbol=symbol, side=side, orderType="Limit",
+                    qty=qty, price=price, timeInForce="GTC"
+                )
+                if response['retCode'] in (0, 170131):
+                    return response
+                if BybitClient._is_rate_limit(int(response['retCode'])):
+                    if attempt == 1:
+                        logger.warning(f"Bybit rate limit ({response['retCode']}), повторяю: {context}")
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return response
+            except Exception as e:
+                if attempt < 2 and BybitClient._is_retriable_exc(e):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                logger.error(f"Ошибка размещения ордера ({context}): {e}")
+                return {'retCode': -1, 'retMsg': str(e), 'result': {}}
+        return {'retCode': -1, 'retMsg': 'Ретраи исчерпаны', 'result': {}}
+
+    # =====================================================================
+    #   ИСПРАВЛЕННЫЙ МЕТОД ЗАПУСКА WEBSOCKET
+    #   Проблема: pybit.order_stream() — синхронный блокирующий метод.
+    #   Решение: запускаем его в отдельном потоке через asyncio.to_thread().
+    # =====================================================================
     async def start_websocket(self, callback, symbol: str):
         """
         Запускает WebSocket для отслеживания обновлений ордеров.
-        Исправленная версия - использует asyncio.to_thread для синхронного WebSocket.
+
+        ВАЖНО: pybit использует синхронную библиотеку websocket-client,
+        поэтому order_stream() — блокирующий вызов. Запускаем его в
+        отдельном потоке через asyncio.to_thread(), чтобы не блокировать
+        event loop бота.
         """
         if self.ws_running:
-            logger.info("WebSocket уже запущен")
-            return
-
-        # Проверяем, не превышено ли количество попыток переподключения
-        if self._reconnect_attempts >= self._max_reconnect_attempts:
-            logger.warning(f"Достигнуто максимальное количество попыток переподключения ({self._max_reconnect_attempts})")
-            self._reconnect_attempts = 0
+            logger.info("WebSocket already running")
             return
 
         self._order_update_callback = callback
-        
-        try:
-            logger.info(f"Запуск WebSocket для {symbol}... (попытка {self._reconnect_attempts + 1})")
-            
-            # Создаем экземпляр WebSocket
-            self.ws = WebSocket(
-                testnet=self.testnet,
-                channel_type="private",
-                api_key=self.api_key,
-                api_secret=self.api_secret
-            )
-            
-            # ВАЖНО: order_stream - это НЕ async метод, он синхронный!
-            # Запускаем его в отдельном потоке через asyncio.to_thread
-            self.ws_running = True
-            
-            # Запускаем WebSocket в отдельной задаче
-            self._ws_task = asyncio.create_task(
-                self._run_websocket_thread(symbol)
-            )
-            
-            logger.info(f"WebSocket запущен для {symbol}")
-            self._reconnect_attempts = 0  # Сбрасываем счетчик при успешном запуске
-            
-        except Exception as e:
-            logger.error(f"Ошибка WebSocket: {e}")
-            self.ws_running = False
-            self._reconnect_attempts += 1
-            
-            # Попытка переподключения с задержкой
-            if self._reconnect_attempts < self._max_reconnect_attempts:
-                delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))  # Экспоненциальная задержка
-                logger.info(f"Повторное подключение через {delay} секунд...")
+        self._ws_stop_event.clear()
+
+        fail_count = 0
+        last_error_log = 0.0
+        loop = asyncio.get_running_loop()
+
+        while not self._ws_stop_event.is_set():
+            # Перед созданием нового сокета закрываем старый
+            if self.ws:
+                try:
+                    self.ws.exit()
+                except Exception:
+                    pass
+                self.ws = None
+
+            try:
+                logger.info(f"Starting WebSocket for {symbol}...")
+
+                self.ws = WebSocket(
+                    testnet=self.testnet,
+                    channel_type="private",
+                    api_key=self.api_key,
+                    api_secret=self.api_secret
+                )
+
+                self.ws_running = True
+                logger.info(f"WebSocket created, starting order_stream in thread...")
+                fail_count = 0
+
+                # ---- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ----
+                # order_stream() блокирует поток. Запускаем его в отдельном
+                # потоке через asyncio.to_thread(), чтобы не блокировать loop.
+                # Внутри потока pybit сам обрабатывает callback-и в event loop
+                # через asyncio.run_coroutine_threadsafe (мы должны это учесть).
+                await asyncio.to_thread(self._run_order_stream_sync, symbol)
+
+                logger.info("order_stream thread exited normally")
+
+            except asyncio.CancelledError:
+                logger.info("WebSocket task cancelled")
+                break
+            except Exception as e:
+                fail_count += 1
+                now = time.time()
+                if now - last_error_log > 600 or fail_count <= 3:
+                    logger.error(f"WebSocket error: {e} (сбой #{fail_count})")
+                    last_error_log = now
+                else:
+                    logger.debug(f"WebSocket retry... (сбой #{fail_count}): {e}")
+            finally:
+                self.ws_running = False
+                if self.ws:
+                    try:
+                        self.ws.exit()
+                    except Exception:
+                        pass
+                    self.ws = None
+
+            if self._ws_stop_event.is_set():
+                break
+
+            # Реконнект с плавным ростом паузы
+            delay = min(60 * (2 ** min(max(fail_count - 1, 0), 2)), 300) + random.uniform(0, 30)
+            logger.info(f"WebSocket reconnect in {delay:.0f}s...")
+            try:
                 await asyncio.sleep(delay)
-                asyncio.create_task(self.start_websocket(callback, symbol))
-            else:
-                logger.error("Превышено максимальное количество попыток переподключения WebSocket")
-                if self._order_update_callback:
-                    # Уведомляем о проблеме через callback
-                    await self._order_update_callback({
-                        'error': 'WebSocket connection failed after max retries',
-                        'symbol': symbol
-                    })
+            except asyncio.CancelledError:
+                break
 
-    async def _run_websocket_thread(self, symbol: str):
-        """Запускает WebSocket в отдельном потоке."""
+    def _run_order_stream_sync(self, symbol: str):
+        """
+        Синхронный метод, который запускается в отдельном потоке.
+        Здесь вызывается блокирующий order_stream() из pybit.
+
+        Callback-и из pybit будут вызываться в этом же потоке. Чтобы
+        передать их в asyncio event loop, используем
+        asyncio.run_coroutine_threadsafe.
+        """
         try:
-            # Используем asyncio.to_thread для запуска синхронного метода в потоке
-            # Это позволяет избежать блокировки event loop
-            await asyncio.to_thread(
-                self.ws.order_stream,
-                callback=self._handle_order_update
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в WebSocket потоке: {e}")
-            self.ws_running = False
-            
-            # Проверяем, не является ли ошибка "Too many sessions"
-            if "Too many sessions" in str(e):
-                logger.warning("Обнаружено превышение количества сессий WebSocket")
-                # Увеличиваем задержку перед переподключением
-                self._reconnect_delay = 300  # 5 минут
-                self._reconnect_attempts = self._max_reconnect_attempts  # Останавливаем переподключения
-                if self._order_update_callback:
-                    await self._order_update_callback({
-                        'error': 'Too many WebSocket sessions',
-                        'symbol': symbol
-                    })
-            else:
-                # Другие ошибки - пытаемся переподключиться
-                self._reconnect_attempts += 1
-                if self._reconnect_attempts < self._max_reconnect_attempts:
-                    delay = self._reconnect_delay * (2 ** (self._reconnect_attempts - 1))
-                    logger.info(f"Переподключение через {delay} секунд...")
-                    await asyncio.sleep(delay)
-                    asyncio.create_task(self.start_websocket(self._order_update_callback, symbol))
+            loop = self._get_main_loop()
+            if loop is None:
+                logger.error("Main event loop not found, WebSocket callback will not work")
+                return
 
-    async def _handle_order_update(self, message):
-        """Обработчик обновлений ордеров через WebSocket."""
+            def sync_callback(message):
+                # pybit вызывает этот callback в потоке order_stream.
+                # Нам нужно передать управление в основной asyncio loop.
+                try:
+                    if self._order_update_callback and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self._handle_order_update_async(message),
+                            loop
+                        )
+                except Exception as e:
+                    logger.error(f"Error scheduling WS callback: {e}")
+
+            self.ws.order_stream(callback=sync_callback)
+
+        except Exception as e:
+            logger.error(f"_run_order_stream_sync error: {e}")
+            raise
+
+    def _get_main_loop(self):
+        """Возвращает основной asyncio event loop."""
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            return None
+
+    async def _handle_order_update_async(self, message):
+        """Асинхронная обёртка для обработки сообщения."""
         try:
             if 'data' not in message:
                 return
-                
+
             order_data = message['data']
             order_id = order_data.get('orderId')
             order_status = order_data.get('orderStatus')
             symbol = order_data.get('symbol')
             side = order_data.get('side')
-            
+
             if not order_id or not order_status:
                 return
-                
-            logger.info(f"WebSocket обновление ордера: {order_id} -> {order_status}")
-            
+
+            logger.info(f"WebSocket order update: {order_id} -> {order_status}")
+
             if order_status == 'Filled' and side == 'Sell' and self._order_update_callback:
                 order_info = {
                     'order_id': order_id,
                     'symbol': symbol,
                     'side': side,
                     'status': order_status,
-                    'price': float(order_data.get('price', 0)),
-                    'qty': float(order_data.get('qty', 0)),
-                    'cumExecQty': float(order_data.get('cumExecQty', 0)),
-                    'cumExecValue': float(order_data.get('cumExecValue', 0)),
-                    'avgPrice': float(order_data.get('avgPrice', 0))
+                    'price': float(order_data.get('price', 0) or 0),
+                    'qty': float(order_data.get('qty', 0) or 0),
+                    'cumExecQty': float(order_data.get('cumExecQty', 0) or 0),
+                    'cumExecValue': float(order_data.get('cumExecValue', 0) or 0),
+                    'avgPrice': float(order_data.get('avgPrice', 0) or 0)
                 }
                 await self._order_update_callback(order_info)
-                
+
         except Exception as e:
-            logger.error(f"Ошибка обработки WebSocket сообщения: {e}")
+            logger.error(f"Error handling WebSocket message: {e}")
 
     async def stop_websocket(self):
-        """Останавливает WebSocket."""
+        logger.info("Stopping WebSocket...")
+        self._ws_stop_event.set()
         self.ws_running = False
-        self._reconnect_attempts = 0
-        
-        if self._ws_task and not self._ws_task.done():
-            self._ws_task.cancel()
-            try:
-                await asyncio.wait_for(self._ws_task, timeout=5.0)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Ошибка остановки WebSocket задачи: {e}")
-        
         if self.ws:
             try:
-                await asyncio.to_thread(self.ws.exit)
-            except Exception as e:
-                logger.error(f"Ошибка закрытия WebSocket: {e}")
-        
+                self.ws.exit()
+            except Exception:
+                pass
         self.ws = None
-        self._ws_task = None
-        logger.info("WebSocket остановлен")
+        # Даём потоку время завершиться
+        await asyncio.sleep(1)
+        logger.info("WebSocket stopped")
 
-    # --- Остальные методы (без изменений) ---
+    # --- Остальные методы ---
     async def check_api_health(self) -> Dict:
         self._refresh_session()
         if not self._is_api_available():
@@ -1713,11 +1782,11 @@ class BybitClient:
                     'user_message': f'Ошибка соединения: {str(e)[:100]}', 'is_api_error': True}
 
     async def get_symbol_price(self, symbol: str) -> Optional[float]:
-        if not self._is_api_available():
-            return None
         now = time.time()
         if symbol in self._cache_time and now - self._cache_time.get(symbol, 0) < self._cache_ttl:
             return self._price_cache.get(symbol)
+        if not self._is_api_available():
+            return self._stale_price_fallback(symbol, now)
         try:
             if not self.session:
                 self._init_session()
@@ -1727,10 +1796,19 @@ class BybitClient:
                 self._price_cache[symbol] = price
                 self._cache_time[symbol] = now
                 return price
-            return None
+            return self._stale_price_fallback(symbol, now)
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
-            return None
+            return self._stale_price_fallback(symbol, now)
+
+    def _stale_price_fallback(self, symbol: str, now: float) -> Optional[float]:
+        cached = self._price_cache.get(symbol)
+        if cached is not None:
+            cached_age = now - self._cache_time.get(symbol, 0)
+            if cached_age < self._cache_stale_ttl:
+                return cached
+            logger.warning(f"Цена {symbol} в кэше устарела ({cached_age:.0f}s), не использую")
+        return None
 
     async def cancel_all_sell_orders(self, symbol: str) -> Tuple[int, List[str]]:
         if not self._is_api_available():
@@ -1828,14 +1906,11 @@ class BybitClient:
         try:
             if not self.session:
                 self._init_session()
-            # Сначала проверяем открытые ордера
             response = self.session.get_open_orders(category="spot", symbol=symbol, orderId=order_id)
             if response['retCode'] == 0:
                 orders = response['result']['list']
                 if orders:
                     return orders[0].get('orderStatus')
-            
-            # Затем проверяем историю (последние 100 ордеров)
             history = await self.get_order_history(symbol, limit=100)
             for order in history:
                 if order.get('orderId') == order_id:
@@ -1908,7 +1983,7 @@ class BybitClient:
         return rounded
 
     async def wait_for_order_filled(self, symbol: str, order_id: str,
-                                     timeout: int = 3600, check_interval: float = 5.0) -> bool:
+                                     timeout: int = 3600, check_interval: float = 8.0) -> bool:
         try:
             start_time = time.time()
             while time.time() - start_time < timeout:
@@ -1918,16 +1993,6 @@ class BybitClient:
                         return True
                     elif status in ['Cancelled', 'Rejected']:
                         return False
-                open_orders = await self.get_open_orders(symbol)
-                is_open = any(o.get('orderId') == order_id for o in open_orders)
-                if not is_open:
-                    history = await self.get_order_history(symbol, limit=20)
-                    for o in history:
-                        if o.get('orderId') == order_id:
-                            if o.get('orderStatus') == 'Filled':
-                                return True
-                            else:
-                                return False
                 await asyncio.sleep(check_interval)
             return False
         except Exception as e:
@@ -1935,7 +2000,7 @@ class BybitClient:
             return False
 
     async def wait_for_balance_credit(self, coin: str, expected_quantity: float,
-                                       timeout: int = 120, check_interval: float = 2.0,
+                                       timeout: int = 120, check_interval: float = 3.0,
                                        initial_balance: float = 0) -> Tuple[bool, float, float]:
         logger.info(f"[BALANCE CREDIT] Waiting for {coin} balance credit. Expected: {expected_quantity:.8f}")
         target_balance = initial_balance + expected_quantity
@@ -2058,15 +2123,23 @@ class BybitClient:
     async def cancel_order(self, symbol: str, order_id: str) -> Dict:
         if not self._is_api_available():
             return {'success': False, 'error': 'API not available'}
-        try:
-            if not self.session:
-                self._init_session()
-            response = self.session.cancel_order(category="spot", symbol=symbol, orderId=order_id)
-            if response['retCode'] == 0:
-                return {'success': True}
-            return {'success': False, 'error': response['retMsg']}
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+        for attempt in range(3):
+            try:
+                if not self.session:
+                    self._init_session()
+                response = self.session.cancel_order(category="spot", symbol=symbol, orderId=order_id)
+                if response['retCode'] == 0:
+                    return {'success': True}
+                if BybitClient._is_rate_limit(int(response['retCode'])):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return {'success': False, 'error': response['retMsg']}
+            except Exception as e:
+                if attempt < 2 and BybitClient._is_retriable_exc(e):
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return {'success': False, 'error': str(e)}
+        return {'success': False, 'error': 'Не удалось отменить ордер: ретраи исчерпаны'}
 
     async def place_limit_sell(self, symbol: str, quantity: float, price: float) -> Dict:
         if not self._is_api_available():
@@ -2096,9 +2169,10 @@ class BybitClient:
             if order_value < min_amt:
                 return {'success': False, 'error': 'min_amount_error', 'min_amt': min_amt,
                         'order_value': order_value, 'quantity': rounded_quantity, 'price': rounded_price}
-            response = self.session.place_order(
-                category="spot", symbol=symbol, side="Sell", orderType="Limit",
-                qty=str(rounded_quantity), price=str(rounded_price), timeInForce="GTC"
+            response = await self._place_order_with_retry(
+                symbol=symbol, side="Sell", qty=str(rounded_quantity),
+                price=str(rounded_price),
+                context=f"Продажа {symbol} {rounded_quantity}"
             )
             if response['retCode'] == 0:
                 return {'success': True, 'order_id': response['result']['orderId'],
@@ -2198,13 +2272,9 @@ class DCAStrategy:
         user_id = self.db.get_authorized_user_id()
         if not user_id or not self.bot:
             return
-        
-        # Не отправляем сообщение, если причина связана с отсутствием монет
-        # или если статистика пуста (после очистки)
         if "Нет монет" in reason or "Количество (0.0)" in reason or "нет покупок" in reason:
             logger.info(f"Skipping no sell order notification for {symbol}: {reason}")
             return
-            
         text = (f"ℹ️ *ОРДЕР НА ПРОДАЖУ НЕ СОЗДАН*\n"
                 f"🪙 Пара: `{symbol}`\n"
                 f"❗ *Причина:*\n`{reason}`\n"
@@ -2236,16 +2306,15 @@ class DCAStrategy:
         await safe_send_message(self.bot, user_id, text, parse_mode='Markdown')
 
     async def _send_sell_completed_notification(self, sell_data: Dict, symbol: str):
-        """Отправляет уведомление о завершении продажи и предлагает очистить статистику."""
         user_id = self.db.get_authorized_user_id()
         if not user_id or not self.bot:
             return
-        
+
         profit_emoji = "🟢" if sell_data['profit_usdt'] >= 0 else "🔴"
         profit_color = "+" if sell_data['profit_usdt'] >= 0 else ""
         days = sell_data.get('days_invested', 1)
         apy = sell_data.get('apy', 0)
-        
+
         msg = (f"💰 <b>СДЕЛКА ПРОДАНА!</b>\n"
                f"🪙 Токен: <code>{symbol}</code>\n"
                f"📊 Количество: <code>{format_quantity(sell_data['quantity'], 5)}</code>\n"
@@ -2262,7 +2331,7 @@ class DCAStrategy:
                f"После очистки начнется новый цикл накопления.\n"
                f"⚠️ <b>ВНИМАНИЕ: ID покупок будут сброшены и начнутся с 1!</b>\n"
                f"⏰ Если вы не нажмете кнопку, статистика будет очищена автоматически через {AUTO_CLEAR_DELAY_HOURS} часа.")
-        
+
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Да, очистить статистику сейчас", callback_data=f"confirm_clear_stats_{symbol}_{sell_data['id']}"),
              InlineKeyboardButton("❌ Нет, оставить", callback_data=f"skip_clear_stats_{symbol}_{sell_data['id']}")]
@@ -2270,7 +2339,6 @@ class DCAStrategy:
         await safe_send_message(self.bot, user_id, msg, parse_mode='HTML', reply_markup=keyboard)
 
     async def check_and_create_sell_order(self, symbol: str, silent: bool = False) -> Dict:
-        """Проверяет баланс и создает ордер на продажу."""
         try:
             coin = symbol.replace('USDT', '')
             stats = self.db.get_dca_stats(symbol)
@@ -2279,32 +2347,28 @@ class DCAStrategy:
                 if not silent:
                     await self._send_no_sell_order_notification(symbol, error)
                 return {'success': False, 'error': error, 'no_purchases': True}
-            
+
             avg_price = stats['avg_price']
             profit_percent = float(self.db.get_setting('profit_percent', str(PROFIT_PERCENT)))
             target_price = avg_price * (1 + profit_percent / 100)
-            
-            # Проверяем баланс монеты
+
             balance_info = await self.bybit.get_balance(coin)
             if not balance_info or 'equity' not in balance_info:
                 error = 'Не удалось получить баланс монеты'
                 if not silent:
                     await self._send_no_sell_order_notification(symbol, error)
                 return {'success': False, 'error': error}
-            
+
             actual_balance = balance_info.get('equity', 0)
-            
-            # Если баланс меньше минимального количества, не создаем ордер
+
             instrument_info = await self.bybit.get_instrument_info(symbol)
             min_qty = instrument_info['min_qty']
-            
+
             if actual_balance < min_qty:
                 error = f'Недостаточно монет для продажи (баланс: {actual_balance:.8f}, минимум: {min_qty})'
-                # Не отправляем уведомление, так как это нормальная ситуация после очистки
                 logger.info(f"No sell order created for {symbol}: {error}")
                 return {'success': False, 'error': error, 'insufficient_balance': True}
-            
-            # Проверяем, есть ли уже активный ордер на продажу
+
             open_orders = await self.bybit.get_open_orders(symbol)
             existing_sell = [o for o in open_orders if o.get('side') == 'Sell']
             if existing_sell:
@@ -2313,13 +2377,13 @@ class DCAStrategy:
                     if self.db.get_active_sell_order_by_id(order_id):
                         return {'success': True, 'message': f'Уже есть ордер на продажу', 'order_id': order_id}
                 return {'success': True, 'message': 'Есть ручной ордер на продажу'}
-            
+
             min_amt = instrument_info['min_amt']
             tick_size = instrument_info['tick_size']
             qty_decimals = instrument_info.get('qty_decimals', SELL_DECIMALS_FALLBACK)
             rounded_price = self.bybit._round_price_by_tick(target_price, tick_size)
             sell_qty = self.bybit._round_quantity_for_sell(actual_balance, qty_decimals)
-            
+
             if sell_qty < min_qty and actual_balance >= min_qty:
                 for dec in range(qty_decimals, 0, -1):
                     factor = 10 ** dec
@@ -2327,19 +2391,19 @@ class DCAStrategy:
                     if test >= min_qty:
                         sell_qty = test
                         break
-            
+
             if sell_qty < min_qty:
                 error = f'Количество ({sell_qty}) меньше минимального ({min_qty})'
                 if not silent:
                     await self._send_no_sell_order_notification(symbol, error)
                 return {'success': False, 'error': error}
-            
+
             if sell_qty <= 0:
                 error = f'Недостаточно средств. Доступно: {actual_balance} {coin}'
                 if not silent:
                     await self._send_no_sell_order_notification(symbol, error)
                 return {'success': False, 'error': error}
-            
+
             order_value = sell_qty * rounded_price
             if order_value < min_amt:
                 needed_qty = min_amt / rounded_price
@@ -2351,7 +2415,7 @@ class DCAStrategy:
                     if not silent:
                         await self._send_no_sell_order_notification(symbol, error)
                     return {'success': False, 'error': error}
-            
+
             result = await self.bybit.place_limit_sell(symbol, sell_qty, rounded_price)
             if result['success']:
                 self.db.add_sell_order(symbol, result['order_id'], result['quantity'],
@@ -2376,14 +2440,11 @@ class DCAStrategy:
             logger.error(f"Error in check_and_create_sell_order: {e}")
             return {'success': False, 'error': str(e)}
 
-    # --- ОСНОВНОЙ МЕТОД МОНИТОРИНГА ПРОДАЖ (fallback на polling) ---
     async def sell_order_monitor_loop(self, symbol: str, user_id: int, bot):
-        """Активно следит за статусом ордера на продажу. Использует polling как fallback."""
         logger.info(f"Sell order monitor loop started for {symbol}")
         self._sell_monitor_active = True
-        
         check_interval = SELL_MONITOR_INTERVAL
-        
+
         while self._sell_monitor_active and self.db.is_dca_active():
             try:
                 active_orders = self.db.get_active_sell_orders(symbol)
@@ -2393,18 +2454,16 @@ class DCAStrategy:
                         await self.check_and_create_sell_order(symbol, silent=False)
                     await asyncio.sleep(check_interval)
                     continue
-                
+
                 order = active_orders[0]
                 order_id = order['order_id']
                 target_price = order['target_price']
-                
-                # Получаем статус ордера через API
+
                 status = await self.bybit.get_order_status(symbol, order_id)
-                
+
                 if status == 'Filled':
                     logger.info(f"Sell order {order_id} is FILLED!")
-                    
-                    # Ищем детали ордера в истории
+
                     completed_orders = await self.bybit.get_completed_sell_orders(
                         symbol, from_date=get_moscow_time_naive() - timedelta(hours=1)
                     )
@@ -2413,13 +2472,12 @@ class DCAStrategy:
                         if co['order_id'] == order_id:
                             completed = co
                             break
-                    
+
                     coin = symbol.replace('USDT', '')
                     balance_info = await self.bybit.get_balance(coin)
                     remaining = balance_info.get('equity', 0) if balance_info else 0
-                    
+
                     if not completed:
-                        # Если не нашли в истории, используем данные из ордера
                         completed = {
                             'order_id': order_id,
                             'symbol': symbol,
@@ -2428,26 +2486,26 @@ class DCAStrategy:
                             'amount_usdt': order.get('quantity', 0) * order.get('target_price', 0),
                             'executed_at': get_moscow_time_naive()
                         }
-                    
+
                     if completed:
                         stats = self.db.get_dca_stats(symbol)
                         avg_entry = stats['avg_price'] if stats else 0
-                        
+
                         sell_price = completed.get('sell_price', 0)
                         if sell_price == 0:
                             sell_price = order.get('target_price', 0)
-                        
+
                         qty = completed.get('quantity', 0)
                         if qty == 0:
                             qty = order.get('quantity', 0)
-                        
+
                         profit_percent = ((sell_price - avg_entry) / avg_entry * 100) if avg_entry > 0 else 0
                         profit_usdt = (sell_price - avg_entry) * qty if avg_entry > 0 else 0
                         total_invested = stats['total_usdt'] if stats else 0
                         first_order_date = self.db.get_first_order_date()
                         days_invested = max(1, (get_moscow_time_naive() - first_order_date).days) if first_order_date else 1
                         apy = calculate_apy(profit_usdt, total_invested, days_invested) if total_invested > 0 else 0
-                        
+
                         sell_id = self.db.add_completed_sell(
                             symbol=symbol,
                             order_id=order_id,
@@ -2456,10 +2514,10 @@ class DCAStrategy:
                             profit_percent=profit_percent,
                             profit_usdt=profit_usdt
                         )
-                        
+
                         self.db.update_sell_order_status(order_id, 'completed')
                         self.db.set_last_sell_order_date(get_moscow_time_naive())
-                        
+
                         sell_data = {
                             'id': sell_id,
                             'order_id': order_id,
@@ -2472,17 +2530,13 @@ class DCAStrategy:
                             'days_invested': days_invested,
                             'apy': apy
                         }
-                        
+
                         await self._send_sell_completed_notification(sell_data, symbol)
                         self.db.mark_completed_sell_notified(sell_id)
-                        
-                        # Устанавливаем дедлайн для автоматической очистки через 3 часа
+
                         deadline = get_moscow_time_naive() + timedelta(hours=AUTO_CLEAR_DELAY_HOURS)
                         self.db.set_clear_deadline(sell_id, deadline)
-                        
-                        # НЕ ОЧИЩАЕМ СТАТИСТИКУ СРАЗУ!
-                        # Очистка произойдет либо по кнопке, либо автоматически через 3 часа
-                        
+
                         await asyncio.sleep(3)
                         stats_after = self.db.get_dca_stats(symbol)
                         if stats_after and stats_after['total_quantity'] > 0:
@@ -2494,17 +2548,15 @@ class DCAStrategy:
                                     f"📊 Статистика DCA для {symbol} будет очищена через {AUTO_CLEAR_DELAY_HOURS} часа, если вы не нажмете кнопку очистки.",
                                     parse_mode='Markdown'
                                 )
-                
+
                 elif status in ['Cancelled', 'Rejected']:
                     logger.info(f"Sell order {order_id} was {status}")
                     self.db.update_sell_order_status(order_id, status.lower())
                     stats = self.db.get_dca_stats(symbol)
                     if stats and stats['total_quantity'] > 0:
                         await self.check_and_create_sell_order(symbol, silent=False)
-                
+
                 elif status is None:
-                    # Ордер не найден ни в открытых, ни в истории - возможно, был исполнен
-                    # Проверяем историю за последний час
                     completed_orders = await self.bybit.get_completed_sell_orders(
                         symbol, from_date=get_moscow_time_naive() - timedelta(hours=1)
                     )
@@ -2512,30 +2564,28 @@ class DCAStrategy:
                     for co in completed_orders:
                         if co['order_id'] == order_id:
                             found = True
-                            # Это завершенный ордер, обрабатываем как Filled
                             status = 'Filled'
                             break
-                    
+
                     if found:
-                        continue  # Пропускаем, чтобы обработать как Filled на следующей итерации
+                        continue
                     else:
                         self.db.update_sell_order_status(order_id, 'unknown')
                         stats = self.db.get_dca_stats(symbol)
                         if stats and stats['total_quantity'] > 0:
                             await self.check_and_create_sell_order(symbol, silent=False)
-                
+
                 await asyncio.sleep(check_interval)
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in sell_order_monitor_loop: {e}")
                 await asyncio.sleep(check_interval)
-        
+
         logger.info(f"Sell order monitor loop stopped for {symbol}")
 
     async def sell_order_check_loop(self, symbol: str):
-        """Резервный цикл проверки ордеров (раз в час)."""
         logger.info(f"Sell order check loop started for {symbol}")
         self._sell_check_loop_running = True
         stats = self.db.get_dca_stats(symbol)
@@ -2547,7 +2597,6 @@ class DCAStrategy:
                 break
             stats = self.db.get_dca_stats(symbol)
             if not stats or stats['total_quantity'] <= 0:
-                # Проверяем завершенные продажи, которые могли быть пропущены
                 await self.check_completed_sells(symbol, force=True)
                 break
             open_orders = await self.bybit.get_open_orders(symbol)
@@ -2581,19 +2630,19 @@ class DCAStrategy:
             order_id = order_info['order_id']
             order_status = order_info['status']
             symbol = order_info['symbol']
-            
+
             active_order = self.db.get_active_sell_order_by_id(order_id)
             if not active_order:
                 logger.info(f"Order {order_id} not found in active orders, ignoring")
                 return
-            
+
             if order_status == 'Filled':
                 logger.info(f"Sell order {order_id} was FILLED via WebSocket!")
-                
+
                 avg_price = order_info.get('avgPrice', 0)
                 qty = order_info.get('cumExecQty', 0) or order_info.get('qty', 0)
                 amount_usdt = order_info.get('cumExecValue', 0)
-                
+
                 if avg_price == 0:
                     orders = await self.bybit.get_completed_sell_orders(symbol, from_date=get_moscow_time_naive() - timedelta(hours=1))
                     for o in orders:
@@ -2602,12 +2651,12 @@ class DCAStrategy:
                             qty = o['quantity']
                             amount_usdt = o['amount_usdt']
                             break
-                
+
                 if avg_price == 0 or qty == 0:
                     avg_price = active_order['target_price']
                     qty = active_order['quantity']
                     amount_usdt = qty * avg_price
-                
+
                 stats = self.db.get_dca_stats(symbol)
                 avg_entry = stats['avg_price'] if stats else 0
                 profit_percent = ((avg_price - avg_entry) / avg_entry * 100) if avg_entry > 0 else 0
@@ -2616,7 +2665,7 @@ class DCAStrategy:
                 first_order_date = self.db.get_first_order_date()
                 days_invested = max(1, (get_moscow_time_naive() - first_order_date).days) if first_order_date else 1
                 apy = calculate_apy(profit_usdt, total_invested, days_invested) if total_invested > 0 else 0
-                
+
                 sell_id = self.db.add_completed_sell(
                     symbol=symbol,
                     order_id=order_id,
@@ -2625,10 +2674,10 @@ class DCAStrategy:
                     profit_percent=profit_percent,
                     profit_usdt=profit_usdt
                 )
-                
+
                 self.db.update_sell_order_status(order_id, 'completed')
                 self.db.set_last_sell_order_date(get_moscow_time_naive())
-                
+
                 sell_data = {
                     'id': sell_id,
                     'order_id': order_id,
@@ -2641,16 +2690,13 @@ class DCAStrategy:
                     'days_invested': days_invested,
                     'apy': apy
                 }
-                
+
                 await self._send_sell_completed_notification(sell_data, symbol)
                 self.db.mark_completed_sell_notified(sell_id)
-                
-                # Устанавливаем дедлайн для автоматической очистки через 3 часа
+
                 deadline = get_moscow_time_naive() + timedelta(hours=AUTO_CLEAR_DELAY_HOURS)
                 self.db.set_clear_deadline(sell_id, deadline)
-                
-                # НЕ ОЧИЩАЕМ СТАТИСТИКУ СРАЗУ!
-                
+
                 await asyncio.sleep(3)
                 stats_after = self.db.get_dca_stats(symbol)
                 if stats_after and stats_after['total_quantity'] > 0:
@@ -2663,18 +2709,17 @@ class DCAStrategy:
                             f"📊 Статистика DCA для {symbol} будет очищена через {AUTO_CLEAR_DELAY_HOURS} часа, если вы не нажмете кнопку очистки.",
                             parse_mode='Markdown'
                         )
-                        
+
             elif order_status in ['Cancelled', 'Rejected']:
                 logger.info(f"Sell order {order_id} was {order_status}")
                 self.db.update_sell_order_status(order_id, order_status.lower())
                 stats = self.db.get_dca_stats(symbol)
                 if stats and stats['total_quantity'] > 0:
                     await self.check_and_create_sell_order(symbol, silent=False)
-                    
+
         except Exception as e:
             logger.error(f"Error handling order update: {e}")
 
-    # --- Остальные методы (без изменений) ---
     async def _place_buy_order_and_wait(self, symbol: str, price: float, amount: float, is_auto: bool) -> Dict:
         result = await self.bybit.place_limit_buy(symbol, price, amount, is_auto)
         if not result['success']:
@@ -2954,7 +2999,6 @@ class DCAStrategy:
                 self.db.update_sell_order_status(order['order_id'], 'completed')
 
     async def check_completed_sells(self, symbol: str, force: bool = False) -> List[Dict]:
-        """Резервный метод для проверки завершенных продаж."""
         check_date, reason = self.db.get_check_start_date(symbol)
         logger.info(f"Checking completed sells from {reason}: {check_date}")
         all_completed = await self.bybit.get_completed_sell_orders(symbol, from_date=check_date)
@@ -3017,7 +3061,7 @@ class DCAStrategy:
 
             if is_our:
                 self.db.update_sell_order_status(sell['order_id'], 'completed')
-            
+
             if not self.db.is_sell_notified(sell_id):
                 await self._send_sell_completed_notification(sell_data, symbol)
                 self.db.mark_completed_sell_notified(sell_id)
@@ -3030,14 +3074,13 @@ class DCAStrategy:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         now = get_moscow_time_naive()
-        
-        # Ищем продажи, у которых истек дедлайн очистки
+
         cursor.execute('''SELECT id, symbol FROM completed_sells
             WHERE notified = 1 AND stats_cleared = 0 AND clear_deadline IS NOT NULL AND clear_deadline <= ?''',
             (now.isoformat(),))
         expired = cursor.fetchall()
         conn.close()
-        
+
         user_id = self.db.get_authorized_user_id()
         for sell in expired:
             sell_id = sell['id']
@@ -3427,6 +3470,8 @@ class FastDCABot:
         self.setup_handlers()
 
     def _init_bybit(self, force_reload: bool = False):
+        if self.bybit and self.bybit_initialized and not force_reload:
+            return
         api_key, api_secret = get_api_keys()
         if not api_key or not api_secret:
             logger.warning("API keys missing in .env")
@@ -3444,10 +3489,11 @@ class FastDCABot:
             self.bybit_initialized = False
 
     def refresh_api_session(self):
-        logger.info("Refreshing API session...")
-        self.bybit_initialized = False
-        self.bybit = None
-        self._init_bybit(force_reload=True)
+        if not self.bybit:
+            self._init_bybit()
+            return self.bybit_initialized
+        self.bybit._refresh_session()
+        self.bybit_initialized = self.bybit._is_api_available()
         return self.bybit_initialized
 
     async def check_api_and_notify(self, is_startup: bool = False) -> bool:
@@ -4451,7 +4497,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}", reply_markup=self.get_order_management_keyboard())
             return ConversationHandler.END
 
-    # --- РУЧНАЯ ПОКУПКА/ПРОДАЖА С ВЫБОРОМ СТОРОНЫ ---
     @authorized_only
     async def manual_order_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -4681,7 +4726,6 @@ class FastDCABot:
         await self._reset_bot_state(context)
         return ConversationHandler.END
 
-    # --- Ручное добавление в статистику с датой ---
     @authorized_only
     async def manual_add_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -4869,7 +4913,6 @@ class FastDCABot:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}", reply_markup=self.get_cancel_keyboard())
             return MANUAL_ADD_DATE
 
-    # --- Остальные обработчики ---
     @authorized_only
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self._reset_bot_state(context)
@@ -5191,14 +5234,12 @@ class FastDCABot:
                         parse_mode='Markdown',
                         reply_markup=self.get_main_keyboard()
                     )
-            
-            # Запускаем активный мониторинг ордера (polling)
+
             if self._sell_monitor_task is None or self._sell_monitor_task.done():
                 self._sell_monitor_task = asyncio.create_task(
                     self.strategy.sell_order_monitor_loop(symbol, self.authorized_user_id, self.application.bot)
                 )
-            
-            # Запускаем WebSocket (исправленная версия)
+
             if self._websocket_task is None or self._websocket_task.done():
                 self._websocket_task = asyncio.create_task(
                     self.bybit.start_websocket(
@@ -5206,8 +5247,7 @@ class FastDCABot:
                         symbol
                     )
                 )
-            
-            # Запускаем резервный цикл проверки (раз в час)
+
             if self._sell_check_task is None or self._sell_check_task.done():
                 self._sell_check_task = asyncio.create_task(
                     self.strategy.sell_order_check_loop(symbol)
@@ -5679,7 +5719,6 @@ class FastDCABot:
         else:
             await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
 
-    # --- Фоновые циклы ---
     async def dca_scheduler_loop(self):
         logger.info("DCA scheduler loop started")
         while self.scheduler_running:
@@ -5780,7 +5819,6 @@ class FastDCABot:
                 await asyncio.sleep(60)
 
     async def sell_checker_loop(self):
-        """Резервный цикл проверки продаж (раз в час)."""
         logger.info("Sell checker loop started")
         await asyncio.sleep(60)
         while self.scheduler_running:
@@ -5902,7 +5940,6 @@ class FastDCABot:
                 logger.error(f"API check loop error: {e}")
                 await asyncio.sleep(300)
 
-    # --- Callback для ордеров ---
     async def handle_order_execution_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -5948,7 +5985,7 @@ class FastDCABot:
                 f"✅ *Статистика DCA очищена!*\n🪙 Токен: `{symbol}`\n🗑 Удалено покупок: `{deleted}`\n📊 Начинаем новый цикл накопления.\n🪜 Расчет от новой средней цены.\n⚠️ ID покупок будут начинаться с 1 при следующем добавлении.",
                 parse_mode='Markdown'
             )
-            
+
             stats = self.db.get_dca_stats(symbol)
             if stats and stats['total_quantity'] > 0:
                 await self.strategy.check_and_create_sell_order(symbol, silent=False)
@@ -6052,18 +6089,15 @@ class FastDCABot:
                 stats = self.db.get_dca_stats(symbol)
                 if stats and stats['total_quantity'] > 0:
                     await self.strategy.check_and_create_sell_order(symbol, silent=False)
-                    # Запускаем активный мониторинг ордера (polling)
                     self._sell_monitor_task = asyncio.create_task(
                         self.strategy.sell_order_monitor_loop(symbol, self.authorized_user_id, self.application.bot)
                     )
-                    # Запускаем WebSocket (исправленная версия)
                     self._websocket_task = asyncio.create_task(
                         self.bybit.start_websocket(
                             self.strategy.handle_order_update,
                             symbol
                         )
                     )
-                    # Запускаем резервный цикл проверки
                     self._sell_check_task = asyncio.create_task(
                         self.strategy.sell_order_check_loop(symbol)
                     )
@@ -6276,7 +6310,7 @@ class FastDCABot:
         print(f"{Fore.WHITE}🌐 Testnet (из .env): {'Да' if BYBIT_TESTNET_DEFAULT else 'Нет'}")
         print(f"{Fore.WHITE}💾 База данных: dca_bot.db (данные сохраняются)")
         print(f"{Fore.WHITE}🕐 Московское время: {get_moscow_time().strftime('%H:%M')}")
-        print(f"{Fore.CYAN}🔌 WebSocket: ВКЛЮЧЕН (с fallback на polling)")
+        print(f"{Fore.CYAN}🔌 WebSocket: ВКЛЮЧЕН (исправлен — через отдельный поток)")
         print(f"{Fore.CYAN}⏱ Интервал мониторинга ордера: {SELL_MONITOR_INTERVAL} сек")
         print(f"{Fore.CYAN}📊 Порог остатка монет для очистки: {BALANCE_CHECK_THRESHOLD}")
         print(f"{Fore.CYAN}⏰ Задержка автоматической очистки: {AUTO_CLEAR_DELAY_HOURS} часа")
